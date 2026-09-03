@@ -123,6 +123,52 @@ impl PlaneLayout {
         // than one row rather than rejecting a frame that is really there.
         buffer + stride >= needed && buffer >= luma
     }
+
+    /// Correct the slice height against the size of a real output buffer.
+    ///
+    /// `MediaFormat` need not carry `slice-height`, and when it does not the
+    /// only thing left to assume is that chroma starts immediately after the
+    /// last visible row. Decoders very often pad - 1080 rows inside a
+    /// 1088-row plane is the ordinary case - and that difference is not a
+    /// size error: the buffer is *bigger* than needed, so [`fits`] passes and
+    /// every length check passes, and the chroma planes are simply read from
+    /// the wrong place. What comes out has correct luma and colour taken from
+    /// the bottom of the luma plane - blocky, patchy, the odd white square,
+    /// and stable enough to look like a codec problem rather than an
+    /// arithmetic one.
+    ///
+    /// The buffer's own size settles it. A 4:2:0 frame is exactly
+    /// `stride * slice_height * 3 / 2` bytes, so the height divides back out.
+    /// Only an exact match is accepted: anything else is a buffer this does
+    /// not understand, and guessing twice is worse than guessing once.
+    ///
+    /// Returns whether it changed anything.
+    ///
+    /// [`fits`]: PlaneLayout::fits
+    pub fn reconcile(&mut self, buffer: usize) -> bool {
+        let stride = self.stride as usize;
+        if stride == 0 || buffer == 0 {
+            return false;
+        }
+
+        // The rows the buffer actually holds, if it holds whole ones.
+        let rows = buffer * 2 / (stride * 3);
+        if rows * stride * 3 / 2 != buffer {
+            // Not a whole number of rows: extra padding, a different
+            // subsampling, or a size that means something else. Leave the
+            // reported layout alone rather than replace one guess with
+            // another.
+            return false;
+        }
+
+        // Padding only ever adds rows, and the picture has to fit.
+        if rows <= self.slice_height as usize || rows < self.height as usize {
+            return false;
+        }
+
+        self.slice_height = rows as u32;
+        true
+    }
 }
 
 /// Convert one decoded picture to tightly packed RGBA.
@@ -212,6 +258,101 @@ fn clamp_u8(value: i32) -> u8 {
 
 #[cfg(test)]
 mod tests {
+
+    /// The layout a 1080p decoder usually reports, and what its buffer
+    /// actually holds: 1088 rows, not 1080.
+    fn padded_1080p() -> PlaneLayout {
+        PlaneLayout {
+            width: 1920,
+            height: 1080,
+            stride: 1920,
+            // What `read_layout` assumes when the format carries no
+            // slice-height: that chroma starts right after the picture.
+            slice_height: 1080,
+            crop_x: 0,
+            crop_y: 0,
+            layout: Layout::Nv12,
+            color_space: ColorSpace::Bt709,
+        }
+    }
+
+    #[test]
+    fn a_padded_plane_is_recovered_from_the_buffer_size() {
+        let mut layout = padded_1080p();
+        // 1088 rows is what the hardware really produced.
+        let buffer = 1920 * 1088 * 3 / 2;
+        assert!(
+            layout.fits(buffer),
+            "the wrong layout passes every size check, which is why this bug \
+             shows up as artifacts rather than as an error"
+        );
+        assert!(layout.reconcile(buffer));
+        assert_eq!(layout.slice_height, 1088);
+    }
+
+    #[test]
+    fn a_layout_that_already_matches_is_left_alone() {
+        let mut layout = padded_1080p();
+        layout.slice_height = 1088;
+        assert!(!layout.reconcile(1920 * 1088 * 3 / 2));
+        assert_eq!(layout.slice_height, 1088);
+    }
+
+    #[test]
+    fn a_buffer_that_is_not_whole_rows_is_not_guessed_at() {
+        let mut layout = padded_1080p();
+        // Trailing padding that is not a multiple of a row: this could mean
+        // anything, and replacing one guess with another would be worse.
+        assert!(!layout.reconcile(1920 * 1088 * 3 / 2 + 17));
+        assert_eq!(layout.slice_height, 1080);
+    }
+
+    #[test]
+    fn a_buffer_too_small_for_the_picture_is_refused() {
+        let mut layout = padded_1080p();
+        // Fewer rows than the visible picture cannot be right whatever the
+        // arithmetic says.
+        assert!(!layout.reconcile(1920 * 720 * 3 / 2));
+        assert_eq!(layout.slice_height, 1080);
+    }
+
+    #[test]
+    fn reconciling_makes_the_colour_come_from_the_right_place() {
+        // A frame whose luma is one value and whose chroma is another, with
+        // eight rows of padding between them. Read with the unpadded layout,
+        // the "chroma" is really luma padding; read with the reconciled one
+        // it is the chroma that was written.
+        let (w, h, pad) = (64usize, 16usize, 8usize);
+        let mut buffer = vec![0u8; w * (h + pad) * 3 / 2];
+        buffer[..w * h].fill(150); // luma
+        buffer[w * h..w * (h + pad)].fill(255); // padding between the planes
+        buffer[w * (h + pad)..].fill(200); // real chroma
+
+        let mut layout = PlaneLayout {
+            width: w as u32,
+            height: h as u32,
+            stride: w as u32,
+            slice_height: h as u32,
+            crop_x: 0,
+            crop_y: 0,
+            layout: Layout::Nv12,
+            color_space: ColorSpace::Bt709,
+        };
+
+        let mut wrong = Vec::new();
+        assert!(to_rgba(&buffer, &layout, &mut wrong));
+
+        assert!(layout.reconcile(buffer.len()));
+        assert_eq!(layout.slice_height, (h + pad) as u32);
+        let mut right = Vec::new();
+        assert!(to_rgba(&buffer, &layout, &mut right));
+
+        assert_ne!(
+            wrong, right,
+            "reading chroma from the padding must not produce the same \
+             picture as reading it from the chroma plane"
+        );
+    }
     use super::*;
 
     /// Build a tightly packed NV12 buffer of a single flat color.

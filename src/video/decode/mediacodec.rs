@@ -170,6 +170,9 @@ fn decode_loop(codec: Codec, sink: &FrameSink, units: Receiver<Vec<u8>>) -> Resu
     log::info!("android: decoding {codec} ({})", codec.mime());
 
     let mut layout: Option<PlaneLayout> = None;
+    // The reported layout is checked against a real buffer once, because
+    // only a real buffer can settle what the format keys leave out.
+    let mut layout_checked = false;
     let mut rgba = Vec::new();
     // A monotonic presentation time. The codec only needs these to increase;
     // the display order is the arrival order on a live feed.
@@ -226,6 +229,28 @@ fn decode_loop(codec: Codec, sink: &FrameSink, units: Receiver<Vec<u8>>) -> Resu
                 let info = *output.info();
                 let produced = info.size() > 0;
                 if produced {
+                    // What the decoder said, against what it actually
+                    // handed over. The format need not report a slice
+                    // height, and when it does not, assuming chroma starts
+                    // at the end of the visible rows is wrong on any decoder
+                    // that pads - which is most of them.
+                    if !layout_checked {
+                        layout_checked = true;
+                        if let Some(layout) = layout.as_mut() {
+                            let size = info.size().max(0) as usize;
+                            if layout.reconcile(size) {
+                                log::warn!(
+                                    "android: the output format understated the plane \
+                                     height; a {} byte buffer says {} rows, not {}",
+                                    size,
+                                    layout.slice_height,
+                                    layout.height
+                                );
+                            }
+                            log::info!("android: {layout:?} for a {size} byte buffer");
+                        }
+                    }
+
                     match layout.as_ref() {
                         Some(layout) => {
                             let offset = info.offset().max(0) as usize;
@@ -291,6 +316,10 @@ fn decode_loop(codec: Codec, sink: &FrameSink, units: Receiver<Vec<u8>>) -> Resu
 
 /// Turn the codec's output format into a plane layout.
 fn read_layout(format: &MediaFormat) -> Result<PlaneLayout, String> {
+    // Everything the decoder chose to report, verbatim. Which keys a device
+    // fills in is the whole question here, and no summary of the ones this
+    // code happens to read can answer it.
+    log::info!("android: output format {format}");
     let coded_width = format
         .i32(KEY_WIDTH)
         .ok_or("the output format has no width")?;
