@@ -182,7 +182,7 @@ impl UdpSource {
                 (Some(socket), None)
             }
             Err(err) => {
-                log::error!(
+                log::debug!(
                     "video: cannot bind {}:{}: {err}",
                     settings.bind,
                     settings.port
@@ -269,7 +269,10 @@ impl RadioSource {
         match Self::try_open(settings) {
             Ok(source) => source,
             Err(error) => {
-                log::error!("radio: {error}");
+                // Reported by the receive loop rather than here: this is
+                // retried every few seconds, and logging from the constructor
+                // puts the same line in the log until the adapter appears.
+                log::debug!("radio: {error}");
                 Self {
                     radio: None,
                     open_error: Some(error),

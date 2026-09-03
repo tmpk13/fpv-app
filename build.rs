@@ -56,17 +56,24 @@ fn main() {
         }
         println!("cargo:rustc-link-lib=static=usb-1.0");
         println!("cargo:rustc-link-lib=log");
-        // The NDK's static C++ runtime. Rust's linker invocation does not
-        // pass the sysroot's own library directory, so the path has to be
-        // named as well as the libraries: without it the link fails on
-        // c++_static, which reads as a missing dependency rather than a
-        // missing search path.
-        println!(
-            "cargo:rustc-link-search=native={}",
-            android_sysroot_lib().display()
-        );
-        println!("cargo:rustc-link-lib=static=c++_static");
-        println!("cargo:rustc-link-lib=static=c++abi");
+
+        // The NDK's static C++ runtime, named by full path rather than with
+        // -L and -l.
+        //
+        // That is not fussiness. The directory holding libc++_static.a also
+        // holds libc.a, and the shared stubs are one level down in an
+        // API-numbered subdirectory - so there is no libc.so beside them.
+        // Putting the directory on the search path therefore makes the `-lc`
+        // at the end of Rust's own link line resolve to the STATIC bionic.
+        // Everything links, and the result crashes before reaching main: a
+        // constructor in static libc calls its own getauxval, which reads
+        // state that only exists in a static executable, and dereferences
+        // null. Naming the two archives directly leaves nothing else in that
+        // directory reachable.
+        let lib = android_sysroot_lib();
+        for archive in ["libc++_static.a", "libc++abi.a"] {
+            println!("cargo:rustc-link-arg={}", lib.join(archive).display());
+        }
     } else {
         let found = pkg_config::Config::new()
             .probe("libusb-1.0")

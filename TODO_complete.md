@@ -122,14 +122,20 @@ a viewer of someone else's.
 - [x] Desktop builds with and without the radio feature
 - [x] aarch64 and armv7 Android cdylibs link devourer and libusb statically,
       export `android_main`, and need no `libc++_shared`
+- [x] Run on a Pixel 8a: installs, starts, renders through Vulkan, loads its
+      config, finds the key file, and executes the whole JNI chain into
+      `UsbManager` - reporting an empty device list from our own code
 
 ## Not done
 
 - No adapter was attached. The radio path is verified by construction and by
   the link layer's tests against the reference implementations, but nothing
   has confirmed that a real RTL8812AU delivers frames through this shim.
-- Android never run on a device, so the USB permission flow is compile-
-  verified only.
+- On Android, everything past an empty USB device list is untested:
+  `hasPermission`, `requestPermission`, `openDevice` and
+  `libusb_wrap_sys_device`. A phone tethered to a computer is a USB device
+  rather than a host, so this needs a session with the adapter on OTG and
+  logs read over WiFi adb.
 - On-screen rendering never confirmed visually - no working screenshot path in
   this environment.
 - Never tested against the real air unit; only against synthetic streams and

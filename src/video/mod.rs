@@ -269,12 +269,16 @@ fn receive_loop(mut source: Source, sink: FrameSink, commands: Receiver<Command>
     let mut last_frame_at: Option<Instant> = None;
     let mut session_started = Instant::now();
     let mut last_retry = Instant::now();
+    // What the source last complained about, so a fault that persists is
+    // reported once rather than every time it is retried.
+    let mut reported_fault: Option<String> = None;
 
     loop {
         match commands.try_recv() {
             Ok(Command::Retune(next)) => {
                 source = next;
                 input = open(&source);
+                reported_fault = None;
                 session = Session::new(source.codec);
                 rates = RateWindow::default();
                 last_packet = None;
@@ -308,6 +312,13 @@ fn receive_loop(mut source: Source, sink: FrameSink, commands: Receiver<Command>
         }
 
         let fault = input.fault();
+        if fault != reported_fault {
+            match fault.as_deref() {
+                Some(message) => log::error!("video: {message}"),
+                None => log::info!("video: the source is up"),
+            }
+            reported_fault = fault.clone();
+        }
 
         // The rate figures and the two "seconds since" clocks have to keep
         // moving while nothing is arriving - that silence is the reading.
@@ -338,7 +349,7 @@ fn receive_loop(mut source: Source, sink: FrameSink, commands: Receiver<Command>
         // exit, and an adapter is usually about to be plugged back in.
         if fault.is_some() && last_retry.elapsed() > RETRY_INTERVAL {
             last_retry = Instant::now();
-            log::info!("video: reopening the source");
+            log::debug!("video: reopening the source");
             input = open(&source);
             session = Session::new(source.codec);
             session_started = Instant::now();
