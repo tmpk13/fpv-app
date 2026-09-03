@@ -25,7 +25,9 @@
 //! own answer is authoritative, and it carries the stride and slice height
 //! that [`crate::video::yuv`] needs and an SPS does not have.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -42,10 +44,15 @@ use super::Decoder;
 
 /// Access units allowed to queue up for the codec thread.
 ///
-/// Small on purpose. If the decoder cannot keep up, the useful response is to
-/// throw pictures away and stay current, not to build a backlog that puts the
-/// display further behind with every frame.
-const QUEUE_DEPTH: usize = 3;
+/// Deep enough that a burst never reaches the sender, because a unit dropped
+/// here is the one kind of loss this pipeline cannot absorb: the decoder
+/// needs every picture, whether or not anybody looks at the result. Frames
+/// are shed after decoding instead, where it costs only smoothness.
+///
+/// A tenth of a second at 120 fps. Latency does not accumulate here - the
+/// decoder consumes as fast as the hardware runs, which is far faster than
+/// the conversion behind it.
+const QUEUE_DEPTH: usize = 12;
 
 /// How long to wait for a codec buffer before going round the loop again.
 ///
@@ -95,17 +102,22 @@ pub struct MediaCodecDecoder {
     /// Kept only to report units dropped before the codec saw them. Without
     /// it the one failure that matters here is the one nothing counts.
     sink: FrameSink,
+    /// How many access units are waiting for the codec. `Receiver` cannot be
+    /// asked, and the decode loop needs to know whether it is behind.
+    waiting: Arc<AtomicUsize>,
 }
 
 impl MediaCodecDecoder {
     pub fn new(codec: Codec, sink: FrameSink) -> Result<Self, String> {
         let (tx, rx) = sync_channel(QUEUE_DEPTH);
         let reporter = sink.clone();
+        let waiting = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&waiting);
 
         thread::Builder::new()
             .name("video-decode".into())
             .spawn(move || {
-                if let Err(err) = decode_loop(codec, &sink, rx) {
+                if let Err(err) = decode_loop(codec, &sink, rx, &counter) {
                     log::error!("android decoder stopped: {err}");
                     sink.note_error();
                 }
@@ -115,6 +127,7 @@ impl MediaCodecDecoder {
         Ok(Self {
             units: tx,
             sink: reporter,
+            waiting,
         })
     }
 }
@@ -122,7 +135,10 @@ impl MediaCodecDecoder {
 impl Decoder for MediaCodecDecoder {
     fn submit(&mut self, unit: &AccessUnit) -> Result<(), String> {
         match self.units.try_send(unit.data.clone()) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.waiting.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
             // The decoder is behind. Dropping the newest unit keeps the
             // receive thread moving - blocking it would turn a decode
             // backlog into packet loss - but it is not free: an inter-frame
@@ -138,7 +154,12 @@ impl Decoder for MediaCodecDecoder {
 }
 
 /// Own the codec and pump it until the channel closes.
-fn decode_loop(codec: Codec, sink: &FrameSink, units: Receiver<Vec<u8>>) -> Result<(), String> {
+fn decode_loop(
+    codec: Codec,
+    sink: &FrameSink,
+    units: Receiver<Vec<u8>>,
+    waiting: &AtomicUsize,
+) -> Result<(), String> {
     // The first unit carries the parameter sets, because the caller only
     // starts submitting at a unit that has them (see `Session::feed`). The
     // codec is configured from it rather than from a later one, so that
@@ -180,19 +201,30 @@ fn decode_loop(codec: Codec, sink: &FrameSink, units: Receiver<Vec<u8>>) -> Resu
     let mut pending = Some(first);
     let mut warned_format = false;
 
-    loop {
-        // Take the next unit without blocking, so output keeps draining even
-        // when nothing is arriving.
-        if pending.is_none() {
-            match units.try_recv() {
-                Ok(unit) => pending = Some(unit),
-                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+    // Labelled because the channel closing has to leave the whole loop, and
+    // it is noticed from inside the inner one that feeds the codec.
+    'decode: loop {
+        // Feed everything the codec will take, before doing anything that
+        // could stall. This is the loop's one hard obligation: the decoder
+        // needs every access unit whether or not the result is ever looked
+        // at, because the pictures nobody sees are still what the next ones
+        // are predicted from. Frames get shed further down instead.
+        loop {
+            if pending.is_none() {
+                match units.try_recv() {
+                    Ok(unit) => {
+                        waiting.fetch_sub(1, Ordering::Relaxed);
+                        pending = Some(unit);
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break 'decode,
+                }
             }
-        }
 
-        if let Some(unit) = pending.take() {
-            match decoder.dequeue_input_buffer(BUFFER_TIMEOUT) {
+            let Some(unit) = pending.take() else {
+                break;
+            };
+            match decoder.dequeue_input_buffer(Duration::ZERO) {
                 Ok(DequeuedInputBufferResult::Buffer(mut buffer)) => {
                     let target = buffer.buffer_mut();
                     if target.len() < unit.len() {
@@ -217,9 +249,12 @@ fn decode_loop(codec: Codec, sink: &FrameSink, units: Receiver<Vec<u8>>) -> Resu
                         }
                     }
                 }
-                // No input buffer free. Keep the unit and try again after the
-                // output side has had a turn, which is what frees one.
-                Ok(DequeuedInputBufferResult::TryAgainLater) => pending = Some(unit),
+                // No input buffer free. Keep the unit and let the output
+                // side have a turn, which is what frees one.
+                Ok(DequeuedInputBufferResult::TryAgainLater) => {
+                    pending = Some(unit);
+                    break;
+                }
                 Err(err) => return Err(format!("dequeueing an input buffer: {err}")),
             }
         }
@@ -227,7 +262,24 @@ fn decode_loop(codec: Codec, sink: &FrameSink, units: Receiver<Vec<u8>>) -> Resu
         match decoder.dequeue_output_buffer(BUFFER_TIMEOUT) {
             Ok(DequeuedOutputBufferInfoResult::Buffer(output)) => {
                 let info = *output.info();
-                let produced = info.size() > 0;
+                // Convert only when the codec has been fed everything
+                // waiting for it. The loop above drains the channel each
+                // pass, so anything still queued means the conversion is
+                // what is behind - and this picture is the cheapest thing
+                // to give up.
+                //
+                // Shedding here rather than at the input is the whole point.
+                // The decoder has already used this picture as a reference,
+                // so skipping its conversion costs one frame of smoothness.
+                // Skipping an access unit at the input instead costs every
+                // frame that referenced it, until the next keyframe, which is
+                // what "blocky patches and pixels from the last picture"
+                // looks like.
+                let behind = waiting.load(Ordering::Relaxed) > 0;
+                let produced = info.size() > 0 && !behind;
+                if info.size() > 0 && behind {
+                    sink.note_frame_shed();
+                }
                 if produced {
                     // What the decoder said, against what it actually
                     // handed over. The format need not report a slice

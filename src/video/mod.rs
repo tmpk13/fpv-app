@@ -93,6 +93,11 @@ pub struct Stats {
     /// isolation, so each of these corrupts every frame after it until the
     /// next keyframe.
     pub units_dropped: u64,
+    /// Decoded pictures released without being drawn, because the conversion
+    /// was behind. Healthy shedding, not loss: the decoder had already used
+    /// them, so nothing downstream is missing anything - it is the same trade
+    /// the frame mailbox makes, one step earlier.
+    pub frames_shed: u64,
     /// Frames the UI never displayed because a newer one replaced them first.
     /// A steady count here means the display is the bottleneck, not the link.
     pub dropped_frames: u64,
@@ -234,6 +239,13 @@ impl FrameSink {
     pub fn note_unit_dropped(&self) {
         if let Ok(mut stats) = self.stats.lock() {
             stats.units_dropped += 1;
+        }
+    }
+
+    /// Record a decoded picture released without being drawn.
+    pub fn note_frame_shed(&self) {
+        if let Ok(mut stats) = self.stats.lock() {
+            stats.frames_shed += 1;
         }
     }
 }
@@ -424,7 +436,7 @@ fn log_summary(stats: &Stats) {
 
     log::info!(
         "video: {}x{} {:?} {:.1} fps {:.1} Mbit/s | rtp_lost={} damaged={} \
-         units_dropped={} decode_err={} ui_dropped={}",
+         units_dropped={} shed={} decode_err={} ui_dropped={}",
         stats.width,
         stats.height,
         stats.codec,
@@ -433,6 +445,7 @@ fn log_summary(stats: &Stats) {
         stats.rtp.lost,
         stats.rtp.damaged,
         stats.units_dropped,
+        stats.frames_shed,
         stats.decode_errors,
         stats.dropped_frames,
     );
