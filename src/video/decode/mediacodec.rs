@@ -92,11 +92,15 @@ const CONFIGURE_HEIGHT: i32 = 1080;
 /// The receive thread's end of an Android hardware decoder.
 pub struct MediaCodecDecoder {
     units: SyncSender<Vec<u8>>,
+    /// Kept only to report units dropped before the codec saw them. Without
+    /// it the one failure that matters here is the one nothing counts.
+    sink: FrameSink,
 }
 
 impl MediaCodecDecoder {
     pub fn new(codec: Codec, sink: FrameSink) -> Result<Self, String> {
         let (tx, rx) = sync_channel(QUEUE_DEPTH);
+        let reporter = sink.clone();
 
         thread::Builder::new()
             .name("video-decode".into())
@@ -108,7 +112,10 @@ impl MediaCodecDecoder {
             })
             .map_err(|err| format!("spawning the decoder thread: {err}"))?;
 
-        Ok(Self { units: tx })
+        Ok(Self {
+            units: tx,
+            sink: reporter,
+        })
     }
 }
 
@@ -116,11 +123,15 @@ impl Decoder for MediaCodecDecoder {
     fn submit(&mut self, unit: &AccessUnit) -> Result<(), String> {
         match self.units.try_send(unit.data.clone()) {
             Ok(()) => Ok(()),
-            // The decoder is behind. Dropping the newest unit is the right
-            // trade on a live feed: the alternative is blocking the receive
-            // thread, which would stop reading the socket and turn a decode
-            // backlog into packet loss.
-            Err(TrySendError::Full(_)) => Ok(()),
+            // The decoder is behind. Dropping the newest unit keeps the
+            // receive thread moving - blocking it would turn a decode
+            // backlog into packet loss - but it is not free: an inter-frame
+            // codec cannot lose one picture in isolation, so this is counted
+            // rather than swallowed.
+            Err(TrySendError::Full(_)) => {
+                self.sink.note_unit_dropped();
+                Ok(())
+            }
             Err(TrySendError::Disconnected(_)) => Err("the decoder thread has gone".into()),
         }
     }

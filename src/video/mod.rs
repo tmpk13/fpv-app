@@ -87,6 +87,12 @@ pub struct Stats {
     /// Pictures out of the decoder, and pictures it refused.
     pub frames: u64,
     pub decode_errors: u64,
+    /// Access units thrown away before the decoder ever saw them, because it
+    /// was behind. Counted separately from every other loss because it is the
+    /// most damaging kind: an inter-frame codec cannot lose one picture in
+    /// isolation, so each of these corrupts every frame after it until the
+    /// next keyframe.
+    pub units_dropped: u64,
     /// Frames the UI never displayed because a newer one replaced them first.
     /// A steady count here means the display is the bottleneck, not the link.
     pub dropped_frames: u64,
@@ -223,6 +229,13 @@ impl FrameSink {
             stats.decode_errors += 1;
         }
     }
+
+    /// Record an access unit thrown away before it reached the decoder.
+    pub fn note_unit_dropped(&self) {
+        if let Ok(mut stats) = self.stats.lock() {
+            stats.units_dropped += 1;
+        }
+    }
 }
 
 /// Start receiving on `source`, decoding into frames the UI can collect.
@@ -272,6 +285,7 @@ fn receive_loop(mut source: Source, sink: FrameSink, commands: Receiver<Command>
     // What the source last complained about, so a fault that persists is
     // reported once rather than every time it is retried.
     let mut reported_fault: Option<String> = None;
+    let mut next_summary = Instant::now() + SUMMARY_INTERVAL;
 
     loop {
         match commands.try_recv() {
@@ -355,6 +369,16 @@ fn receive_loop(mut source: Source, sink: FrameSink, commands: Receiver<Command>
             session_started = Instant::now();
         }
 
+        // A line the Link page cannot be read over: on a phone in the air,
+        // or one whose screen is off, the log is the only place these
+        // numbers exist.
+        if Instant::now() >= next_summary {
+            next_summary = Instant::now() + SUMMARY_INTERVAL;
+            if let Ok(stats) = sink.stats.lock() {
+                log_summary(&stats);
+            }
+        }
+
         // Packets arriving with no pictures coming out means the decoder is
         // holding a stream it cannot decode - most often because the air unit
         // rebooted into the other codec, which nothing downstream would ever
@@ -366,6 +390,52 @@ fn receive_loop(mut source: Source, sink: FrameSink, commands: Receiver<Command>
             last_frame_at = None;
         }
     }
+}
+
+/// How often the receive loop writes a one-line summary to the log.
+const SUMMARY_INTERVAL: Duration = Duration::from_secs(5);
+
+/// One line with everything needed to tell the failure modes apart.
+///
+/// Quiet until something is arriving, so an idle app does not fill the log.
+fn log_summary(stats: &Stats) {
+    if stats.rtp.packets == 0 {
+        return;
+    }
+
+    #[cfg(feature = "radio")]
+    if let Some(radio) = stats.radio.as_ref() {
+        let link = &radio.link;
+        log::info!(
+            "link: heard={} ours={} crc={} session={} dec_err={} out={} fec={} lost={} \
+             queue_drop={} rssi={:?}",
+            link.total_frames,
+            link.frames,
+            link.crc_errors,
+            if link.has_session() { "ok" } else { "none" },
+            link.decrypt_errors,
+            link.agg.packets_out,
+            link.agg.recovered,
+            link.agg.packets_lost,
+            radio.queue_drops,
+            radio.signal.rssi_dbm,
+        );
+    }
+
+    log::info!(
+        "video: {}x{} {:?} {:.1} fps {:.1} Mbit/s | rtp_lost={} damaged={} \
+         units_dropped={} decode_err={} ui_dropped={}",
+        stats.width,
+        stats.height,
+        stats.codec,
+        stats.fps,
+        stats.bitrate_bps / 1e6,
+        stats.rtp.lost,
+        stats.rtp.damaged,
+        stats.units_dropped,
+        stats.decode_errors,
+        stats.dropped_frames,
+    );
 }
 
 /// How long to wait before reopening a source that failed.

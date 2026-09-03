@@ -22,6 +22,8 @@
 use std::time::{Duration, Instant};
 
 use drone_app::radio::{Bandwidth, Radio, RadioConfig};
+use drone_app::video::codec::Detector;
+use drone_app::video::rtp::Depayloader;
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -92,6 +94,17 @@ fn main() {
     let mut bytes = 0u64;
     let mut next_report = Instant::now();
 
+    // The RTP side too, so the probe reports what the air unit is actually
+    // sending rather than only that something is arriving. Access units per
+    // second is the source frame rate, which is the number to compare a
+    // decoder's output against - without it, "50 fps" has nothing to be
+    // slow relative to.
+    let mut detector = Detector::default();
+    let mut depay: Option<Depayloader> = None;
+    let mut units = 0u64;
+    let mut keyframes = 0u64;
+    let mut last_units = 0u64;
+
     while Instant::now() < deadline {
         // Draining the queue is what lets the counters move: a full queue
         // stops the link layer delivering, and would read as a dead link.
@@ -106,6 +119,22 @@ fn main() {
                 Some(packet) => {
                     packets += 1;
                     bytes += packet.len() as u64;
+
+                    if depay.is_none() {
+                        // The RTP header is 12 bytes plus four per CSRC
+                        // entry; the detector only needs to land on the
+                        // first NAL header.
+                        let offset =
+                            12 + 4 * usize::from(packet.first().copied().unwrap_or(0) & 0x0f);
+                        if let Some(codec) = packet.get(offset..).and_then(|p| detector.push(p)) {
+                            println!("codec: {codec}");
+                            depay = Some(Depayloader::new(codec));
+                        }
+                    }
+                    if let Some(unit) = depay.as_mut().and_then(|d| d.push(&packet)) {
+                        units += 1;
+                        keyframes += u64::from(unit.keyframe);
+                    }
                 }
                 None => break,
             }
@@ -120,25 +149,29 @@ fn main() {
                 .rssi_dbm
                 .map(|dbm| format!("{dbm} dBm"))
                 .unwrap_or_else(|| "-".into());
+            let rtp = depay.as_ref().map(|d| d.stats()).unwrap_or_default();
             println!(
-                "{:<10} heard={:<7} ours={:<6} crc={:<5} session={:<18} \
-                 dec_ok={:<6} dec_err={:<5} out={:<7} fec={:<5} lost={:<5} rssi={}",
+                "{:<10} heard={:<7} ours={:<6} session={:<16} dec_err={:<4} \
+                 out={:<7} fec={:<4} lost={:<4} | fps={:<4} rtp_lost={:<4} \
+                 damaged={:<4} rssi={}",
                 stats.chip,
                 link.total_frames,
                 link.frames,
-                link.crc_errors,
                 if link.has_session() {
                     format!("{} of {} ep{}", link.fec_k, link.fec_n, link.epoch)
                 } else {
                     "none".into()
                 },
-                link.decrypted,
                 link.decrypt_errors,
                 link.agg.packets_out,
                 link.agg.recovered,
                 link.agg.packets_lost,
+                units - last_units,
+                rtp.lost,
+                rtp.damaged,
                 signal,
             );
+            last_units = units;
         }
 
         if let Some(fault) = radio.fault() {
@@ -147,7 +180,16 @@ fn main() {
         }
     }
 
-    println!("\n{packets} packets, {bytes} bytes handed on in {seconds} s");
+    println!(
+        "\n{packets} packets, {bytes} bytes, {units} pictures ({keyframes} keyframes) in {seconds} s"
+    );
+    if units > 0 {
+        println!(
+            "source frame rate: {:.1} fps, {:.1} Mbit/s",
+            units as f64 / f64::from(seconds),
+            8.0 * bytes as f64 / f64::from(seconds) / 1e6
+        );
+    }
     let stats = radio.stats();
     let link = stats.link;
     if link.total_frames == 0 {

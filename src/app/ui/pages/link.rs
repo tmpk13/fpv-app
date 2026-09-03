@@ -80,6 +80,16 @@ impl DroneApp {
                 reading(ui, "Pictures", &count(stats.rtp.access_units), None);
                 reading(ui, "Incomplete", &count(stats.rtp.damaged), None);
                 reading(ui, "Decoded", &count(stats.frames), None);
+                // The most damaging loss on the page, and the least obvious:
+                // a dropped access unit corrupts every picture after it until
+                // the next keyframe, so any number here explains artifacts
+                // that none of the other counters would.
+                reading(
+                    ui,
+                    "Dropped before decoding",
+                    &count(stats.units_dropped),
+                    (stats.units_dropped > 0).then_some(settings.error),
+                );
                 reading(
                     ui,
                     "Decode errors",
