@@ -40,7 +40,7 @@ use crate::video::rtp::AccessUnit;
 use crate::video::yuv::{ColorSpace, Layout, PlaneLayout};
 use crate::video::{yuv, Codec, Frame, FrameSink};
 
-use super::Decoder;
+use super::{should_convert, Decoder};
 
 /// Access units allowed to queue up for the codec thread.
 ///
@@ -167,6 +167,10 @@ fn decode_loop(
     let first = units
         .recv()
         .map_err(|_| "the decoder was dropped before any data arrived".to_string())?;
+    // This one came off the channel too. Every unit the sender counts must be
+    // counted back off, or the loop below believes it is permanently behind
+    // and never converts anything - a blank screen from an off-by-one.
+    waiting.fetch_sub(1, Ordering::Relaxed);
 
     let decoder = MediaCodec::from_decoder_type(codec.mime())
         .ok_or_else(|| format!("no {} decoder on this device", codec.mime()))?;
@@ -200,6 +204,8 @@ fn decode_loop(
     let mut pts: u64 = 0;
     let mut pending = Some(first);
     let mut warned_format = false;
+    // How many pictures have been shed in a row without one getting through.
+    let mut shed_run = 0u32;
 
     // Labelled because the channel closing has to leave the whole loop, and
     // it is noticed from inside the inner one that feeds the codec.
@@ -276,9 +282,15 @@ fn decode_loop(
                 // what "blocky patches and pixels from the last picture"
                 // looks like.
                 let behind = waiting.load(Ordering::Relaxed) > 0;
-                let produced = info.size() > 0 && !behind;
-                if info.size() > 0 && behind {
-                    sink.note_frame_shed();
+                let convert = should_convert(behind, shed_run);
+                let produced = info.size() > 0 && convert;
+                if info.size() > 0 {
+                    if convert {
+                        shed_run = 0;
+                    } else {
+                        shed_run += 1;
+                        sink.note_frame_shed();
+                    }
                 }
                 if produced {
                     // What the decoder said, against what it actually
