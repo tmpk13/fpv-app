@@ -118,17 +118,38 @@ from a NativeActivity via `android_main` (`src/lib.rs`). The Android build uses
 the `wgpu` renderer and decodes with `AMediaCodec` straight from the NDK, so
 there is no Java shim and no dex to build.
 
-### The phone is a viewer only
+### The phone is a viewer only - in this app, by choice
 
-There is no Android equivalent of `vrx.sh up` or `vrx.sh rx`, and there cannot
-be a useful one on a stock phone. `up` puts the RTL8812AU into monitor mode on
-a channel, which needs root, the patched kernel driver and a regulatory domain;
-`rx` captures raw 802.11 frames and does FEC and ChaCha20 decryption on them.
-Android gives an unprivileged app none of that - no monitor mode, no raw
-sockets, and no way to load a kernel driver for the dongle. The decrypt and FEC
-half is ordinary computation and could be ported; the radio half is the wall.
+There is no Android equivalent of `vrx.sh up` or `vrx.sh rx` here: the phone
+receives RTP that a ground station has already decrypted, and does not drive a
+radio itself.
 
-So the laptop keeps doing both, and sends the RTP on to the phone. `wfb_rx`
+That is a limitation of this app, **not** of Android.
+[PixelPilot](https://github.com/OpenIPC/PixelPilot) runs the whole wfb-ng
+receive path on an ordinary unrooted phone, and the piece that makes it
+possible is [devourer](https://github.com/OpenIPC/devourer) - a userspace
+Realtek driver that talks to the chip over libusb with no kernel module at all.
+Android hands an app a file descriptor for a USB device it has been granted
+permission for, libusb adopts that descriptor, and the driver then drives the
+adapter's registers and bulk endpoints directly from the app's own process.
+Monitor-mode RX, no root, no custom kernel. Plug an RTL8812AU into OTG, grant
+the USB permission, copy `gs.key` over, and the phone is the ground station.
+
+So the honest statement of the trade is: this app took the forwarding route,
+which needs a laptop running `wfb_rx` but no special adapter on the phone and
+no GPL-licensed driver linked in (devourer is GPL-2.0, this crate is MIT).
+PixelPilot took the radio route, which needs the adapter and OTG but no laptop.
+Notably it does not currently do the forwarded-stream case at all - its README
+lists that as a future improvement - so the two cover opposite halves.
+
+Taking the radio route here would mean cross-compiling devourer for Android,
+an FFI shim to reach its C++ `IRtlDevice` API, USB permission and
+descriptor-passing through the JVM, and then the wfb-ng link layer itself:
+radiotap and 802.11 parsing, link-id filtering, ChaCha20-Poly1305, and
+Reed-Solomon FEC. The link layer is ordinary portable computation; the driver
+and the USB plumbing are the work.
+
+For now the laptop does both, and sends the RTP on to the phone. `wfb_rx`
 takes the destination directly, so nothing needs to be forwarded or relayed:
 
 ```sh
