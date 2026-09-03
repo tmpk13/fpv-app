@@ -38,15 +38,35 @@ pub const SETTINGS_SAVE: &str =
 pub const NO_VIDEO_TITLE: &str = "No video";
 
 /// Nothing has ever arrived on the socket.
-pub fn no_packets(bind: &str, port: u16) -> String {
-    format!(
+///
+/// `remote` asks for the version aimed at a viewer that is not the machine
+/// running wfb_rx. It is the more common mistake by far on a phone, because
+/// wfb_rx sends to 127.0.0.1 unless told otherwise: the ground station looks
+/// completely healthy, the laptop's own view works, and the phone sits on a
+/// silent socket with nothing anywhere to say why.
+pub fn no_packets(bind: &str, port: u16, remote: bool) -> String {
+    let start = format!(
         "Nothing is arriving on {bind}:{port}.\n\n\
          Start the receiver on the ground station:\n\
-         sudo ./vrx.sh up 161\n\
-         ./vrx.sh rx\n\n\
-         If wfb_rx is already running, check that it was given -u {port}, \
-         and that the channel, key and link id match the air unit."
-    )
+         sudo ./vrx.sh up 161\n"
+    );
+    if remote {
+        format!(
+            "{start}\n\
+             Then point wfb_rx at this device - it sends to 127.0.0.1 unless\n\
+             given -c, so `./vrx.sh rx` alone never reaches it:\n\
+             wfb_rx -p 0 -u {port} -K gs.key -i <link id> \\\n\
+             \x20   -c <this device's ip> <interface>\n\n\
+             Check too that the channel, key and link id match the air unit, \
+             and that both devices are on the same network."
+        )
+    } else {
+        format!(
+            "{start}./vrx.sh rx\n\n\
+             If wfb_rx is already running, check that it was given -u {port}, \
+             and that the channel, key and link id match the air unit."
+        )
+    }
 }
 
 /// Packets were arriving and then stopped.

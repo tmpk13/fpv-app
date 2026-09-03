@@ -136,7 +136,12 @@ impl DroneApp {
             text::bind_failed(reason, &bind, port)
         } else {
             match (stats.since_packet_s, stats.since_frame_s) {
-                (None, _) => text::no_packets(&bind, port),
+                // On Android wfb_rx is on another machine by definition -
+                // the phone cannot drive the dongle - so the advice there is
+                // always the `-c` version. The bind address cannot stand in
+                // for this: the desktop app also defaults to 0.0.0.0, and
+                // that already covers loopback.
+                (None, _) => text::no_packets(&bind, port, cfg!(target_os = "android")),
                 (Some(quiet), _) if quiet > 2.0 => text::packets_stopped(quiet),
                 (Some(_), None) => text::NO_FRAMES.to_string(),
                 (Some(_), Some(_)) => text::NO_FRAMES.to_string(),

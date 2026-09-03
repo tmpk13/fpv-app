@@ -118,14 +118,37 @@ from a NativeActivity via `android_main` (`src/lib.rs`). The Android build uses
 the `wgpu` renderer and decodes with `AMediaCodec` straight from the NDK, so
 there is no Java shim and no dex to build.
 
-The phone cannot run `wfb_rx` on the VRX dongle, so it receives RTP forwarded
-over WiFi from the ground station. Point the forwarder at the phone and set the
-same port on the Settings page:
+### The phone is a viewer only
+
+There is no Android equivalent of `vrx.sh up` or `vrx.sh rx`, and there cannot
+be a useful one on a stock phone. `up` puts the RTL8812AU into monitor mode on
+a channel, which needs root, the patched kernel driver and a regulatory domain;
+`rx` captures raw 802.11 frames and does FEC and ChaCha20 decryption on them.
+Android gives an unprivileged app none of that - no monitor mode, no raw
+sockets, and no way to load a kernel driver for the dongle. The decrypt and FEC
+half is ordinary computation and could be ported; the radio half is the wall.
+
+So the laptop keeps doing both, and sends the RTP on to the phone. `wfb_rx`
+takes the destination directly, so nothing needs to be forwarded or relayed:
 
 ```sh
-# on the ground station, alongside the local view
-socat -u UDP-RECV:5600 UDP-SENDTO:<phone ip>:5600
+# on the ground station, in the drone-cam checkout
+sudo ./vrx.sh up 161
+
+# then, instead of ./vrx.sh rx, aim wfb_rx at the phone
+sudo ~/wfb-ng/wfb_rx -p 0 -u 5600 -K ~/wfb-ng/gs.key -i 7669206 \
+    -c <phone ip> <interface>
 ```
+
+On the phone, leave `bind` at `0.0.0.0` (the default - `127.0.0.1` would only
+hear itself) and set the same port on the Settings page.
+
+`wfb_rx` sends to one address, so this replaces the local view rather than
+adding to it. To watch on both at once, run a second `wfb_rx` on the same
+interface with its own `-c`/`-u`: each instance opens its own capture handle
+and both see every frame. Do not try to share one port between two viewers -
+`SO_REUSEPORT` load-balances UDP datagrams across the sockets rather than
+duplicating them, so each viewer would get roughly half the stream.
 
 Prerequisites: Android SDK + NDK, and `rustup target add aarch64-linux-android`
 (add `armv7-linux-androideabi` too for 32-bit devices).
