@@ -149,7 +149,18 @@ pub enum RadioStage {
 }
 
 /// What to say about a radio link with no picture.
-pub fn radio_no_video(stage: RadioStage, channel: u8, width: &str, link_id: u32) -> String {
+///
+/// `key` is named rather than described because a ground station usually has
+/// more than one lying about - one per air unit, plus whatever came with the
+/// hardware - and "the key is wrong" is not actionable when you cannot see
+/// which of them is being read.
+pub fn radio_no_video(
+    stage: RadioStage,
+    channel: u8,
+    width: &str,
+    link_id: u32,
+    key: &str,
+) -> String {
     match stage {
         RadioStage::Silent => format!(
             "Listening on channel {channel} at {width}, and the band is \n\
@@ -164,12 +175,15 @@ pub fn radio_no_video(stage: RadioStage, channel: u8, width: &str, link_id: u32)
              one is set to {link_id}. In the drone-cam checkout, \n\
              `sudo ./vrx.sh scan` reads the id off the air."
         ),
-        RadioStage::NoSession => "Our frames are arriving, but none of them opens.\n\n\
+        RadioStage::NoSession => format!(
+            "Our frames are arriving, but none of them opens.\n\n\
              The air unit is transmitting and the link id matches, so what is \
-             left is the key: this ground station has a gs.key that is not \
-             the peer of the drone.key the air unit was flashed with. Copy \
-             the pair from the ground station that works."
-            .to_string(),
+             left is the key. This one:\n\
+             {key}\n\
+             is not the peer of the drone.key the air unit was flashed with. \
+             Point the Settings page at the gs.key that came from the ground \
+             station this air unit was paired with."
+        ),
         RadioStage::NotDecrypting => {
             "The session is up but the video packets are being rejected.\n\n\
              Usually two air units on one link id, or a key that changed \

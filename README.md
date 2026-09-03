@@ -147,6 +147,29 @@ The in-kernel driver must not be holding the dongle. drone-cam's `vrx.sh bind`
 handles that, or blacklist `rtw88_8812au` by hand - devourer needs the device
 unclaimed, not a patched driver.
 
+### Checking a link without the GUI
+
+`link-probe` is the Link page as a terminal program, for the question a black
+screen cannot answer:
+
+```sh
+cargo run --example link-probe -- --key ~/wfb-ng/gs.key --channel 161
+```
+
+```text
+RTL8812A  heard=6476  ours=6170  session=8 of 12 ep0  dec_ok=5723  dec_err=0  out=3831  fec=16  rssi=-36 dBm
+```
+
+Four counters separate four faults that all look like a black screen:
+
+| reading | what it means |
+| --- | --- |
+| `heard=0` | nothing on this channel; wrong channel, or nothing transmitting |
+| `heard>0 ours=0` | someone else's traffic; the link id does not match |
+| `ours>0 session=none` | wrong key. `dec_err` rising by one a second is the session announcement failing |
+| `session=ok out=0` | the session is up but no data opens |
+| `out>0` | the link works, and anything wrong is downstream in the video |
+
 ### Without an adapter, or without a drone
 
 Set the source to `udp` and feed it a synthetic stream:
@@ -304,6 +327,9 @@ cargo test
   to RTP, the app receives, depayloads and decodes it. Skipped when ffmpeg has
   no encoder
 
-What is not covered is the hardware: no adapter was attached while this was
-written, so the radio path is verified by construction and by the link layer's
-tests, not on the air. See TODO_complete.md for exactly what that leaves open.
+Beyond the test suite, the radio path has been run against a real air unit on
+an RTL8812AU-VS: devourer brought the chip up, the link layer opened the
+session, and 4 MB of video came out in eight seconds with no decrypt errors
+and sixteen packets repaired by the erasure code. What that leaves untested is
+listed in TODO_complete.md - chiefly the Android USB permission flow, which
+needs the adapter on OTG rather than a phone tethered to a computer.

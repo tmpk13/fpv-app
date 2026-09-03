@@ -142,6 +142,7 @@ impl DroneApp {
                 source.radio.channel,
                 source.radio.bandwidth.as_str(),
                 source.radio.link_id,
+                &source.radio.key_path.display().to_string(),
             )
         } else {
             let bind = source.udp.bind.to_string();
