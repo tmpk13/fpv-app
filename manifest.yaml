@@ -1,0 +1,17 @@
+# xbuild reads THIS file (not Cargo.toml's [package.metadata.android], which is
+# cargo-apk's schema). The two lists are duplicates by necessity: keep them in
+# step, or an APK built with the other tool loses permissions with no
+# build-time complaint. cargo-apk is the only way to get an armeabi-v7a APK, so
+# its copy matters.
+#
+# The stream arrives over the local network from the ground station, so the app
+# needs the network permissions and nothing else - no camera, no storage, no
+# location. INTERNET is what allows a socket to be opened at all; without it
+# the bind fails and the Video page reports "permission denied".
+android:
+  manifest:
+    package: rs.drone.app
+    uses_permission:
+      - name: android.permission.INTERNET
+      - name: android.permission.ACCESS_NETWORK_STATE
+      - name: android.permission.ACCESS_WIFI_STATE

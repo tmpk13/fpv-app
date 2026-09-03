@@ -1,0 +1,91 @@
+[package]
+name = "drone-app"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Ground-station video viewer for a wfb-ng FPV link"
+
+# Desktop builds link the [[bin]] against the lib (rlib); Android builds load
+# the cdylib from a NativeActivity. One crate, both targets - the same split
+# gps-gui-rs uses.
+[lib]
+name = "drone_app"
+crate-type = ["lib", "cdylib"]
+
+[[bin]]
+name = "drone-app"
+path = "src/main.rs"
+
+[dependencies]
+egui = "0.35"
+log = "0.4"
+# Loading the TOML config file. Both pure Rust, so they cross-compile to
+# Android unchanged.
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+# Writing the config back from the Settings page without losing the comments
+# and key order of a hand-edited file.
+toml_edit = "0.22"
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+eframe = "0.35"
+env_logger = "0.11"
+# Desktop decode. The RTP side is ours (src/video/rtp.rs), so gstreamer is fed
+# Annex-B through an appsrc and only does parse + decode + convert; it is not
+# receiving or depayloading. Default features build against the oldest
+# supported GStreamer API, which keeps this working on 1.20-era distros.
+gstreamer = "0.25"
+gstreamer-app = "0.25"
+# For VideoInfo/VideoFrame: appsink buffers carry row padding, and reading the
+# stride out of the frame is the only correct way to copy them.
+gstreamer-video = "0.25"
+
+[target.'cfg(target_os = "android")'.dependencies]
+# Android needs the wgpu renderer. native-activity works with the no-Java
+# xbuild / cargo-apk flow; switch to "android-game-activity" if you build the
+# Gradle/GameActivity project instead.
+eframe = { version = "0.35", default-features = false, features = [
+    "android-native-activity",
+    "wgpu",
+    "default_fonts",
+] }
+egui-winit = "0.35"
+android_logger = "0.15"
+# Hardware decode through the NDK's AMediaCodec. This is a plain C API in
+# libmediandk.so, already part of the NDK, so there is no Java shim and no
+# dex to build - unlike gps-gui-rs, which needs one for BLE and location.
+ndk = { version = "0.9", features = ["media"] }
+
+# Read by cargo-apk / cargo-ndk tooling; xbuild ignores this block and reads
+# manifest.yaml instead, so the permission list below must stay in step with
+# that file or an APK built the other way silently loses permissions.
+[package.metadata.android]
+package = "rs.drone.app"
+build_targets = ["aarch64-linux-android", "armv7-linux-androideabi"]
+
+[package.metadata.android.sdk]
+# AMediaCodec's buffer API is API 21; the output-format query used to read the
+# stride back is API 21 too. Nothing here needs newer.
+min_sdk_version = 21
+target_sdk_version = 33
+
+# The stream arrives over the local network from the ground station, so the
+# app needs the network permissions but no camera and no storage.
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"
+[[package.metadata.android.uses_permission]]
+name = "android.permission.ACCESS_NETWORK_STATE"
+# Binding a UDP port and receiving from the ground station over WiFi. Not a
+# runtime permission, but required to see the link state on the Link page.
+[[package.metadata.android.uses_permission]]
+name = "android.permission.ACCESS_WIFI_STATE"
+
+[profile.dev]
+opt-level = 1
+
+# Video decode and the YUV->RGBA conversion are far too slow in a debug build:
+# unoptimized, a 1080p frame conversion alone misses frame rate. The
+# dependencies carry the codec and the pixel loops, so they get real
+# optimization even in a dev build.
+[profile.dev.package."*"]
+opt-level = 3
