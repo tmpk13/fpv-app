@@ -2,8 +2,14 @@
 name = "drone-app"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
-description = "Ground-station video viewer for a wfb-ng FPV link"
+# GPL-2.0, not MIT, because the default build links devourer, which is
+# GPL-2.0 with no upgrade clause. Every file this project wrote is itself
+# dual licensed "MIT OR GPL-2.0-only" and carries that as an SPDX line, so
+# the pieces stay reusable; it is the combination that is GPL. A build with
+# --no-default-features links no devourer and is MIT throughout.
+license = "GPL-2.0-only"
+description = "Ground station for a wfb-ng FPV link: receives on the radio and shows the video"
+build = "build.rs"
 
 # Desktop builds link the [[bin]] against the lib (rlib); Android builds load
 # the cdylib from a NativeActivity. One crate, both targets - the same split
@@ -16,12 +22,26 @@ crate-type = ["lib", "cdylib"]
 name = "drone-app"
 path = "src/main.rs"
 
+[features]
+# The radio path: devourer, libusb and the wfb-ng link layer. On by default -
+# it is the point of the app - and turning it off leaves the RTP-over-UDP
+# viewer, which needs no C dependencies and no special adapter.
+default = ["radio"]
+radio = []
+# Every Realtek backend devourer supports rather than the FPV set. Roughly
+# quadruples the native library, so it is opt-in.
+radio-all-chips = ["radio"]
+
 [dependencies]
+chacha20 = { version = "0.10", default-features = false, features = ["legacy"] }
+crypto_box = { version = "0.9", default-features = false, features = ["salsa20", "alloc"] }
 egui = "0.35"
 log = "0.4"
+poly1305 = { version = "0.9", default-features = false }
 # Loading the TOML config file. Both pure Rust, so they cross-compile to
 # Android unchanged.
 serde = { version = "1", features = ["derive"] }
+subtle = { version = "2", default-features = false }
 toml = "0.8"
 # Writing the config back from the Settings page without losing the comments
 # and key order of a hand-edited file.
@@ -55,6 +75,8 @@ android_logger = "0.15"
 # libmediandk.so, already part of the NDK, so there is no Java shim and no
 # dex to build - unlike gps-gui-rs, which needs one for BLE and location.
 ndk = { version = "0.9", features = ["media"] }
+jni = "0.21"
+ndk-context = "0.1"
 
 # Read by cargo-apk / cargo-ndk tooling; xbuild ignores this block and reads
 # manifest.yaml instead, so the permission list below must stay in step with
@@ -64,13 +86,15 @@ package = "rs.drone.app"
 build_targets = ["aarch64-linux-android", "armv7-linux-androideabi"]
 
 [package.metadata.android.sdk]
-# AMediaCodec's buffer API is API 21; the output-format query used to read the
-# stride back is API 21 too. Nothing here needs newer.
+# AMediaCodec's buffer API is API 21, the output-format query used to read the
+# stride back is API 21, and USB host is far older. Nothing here needs newer.
+# Keep in step with MIN_SDK in build.rs, which is what devourer and libusb are
+# compiled against.
 min_sdk_version = 21
 target_sdk_version = 33
 
-# The stream arrives over the local network from the ground station, so the
-# app needs the network permissions but no camera and no storage.
+# The network permissions are for the forwarded-RTP source, which is still
+# available; the radio needs none of them. No camera and no storage.
 [[package.metadata.android.uses_permission]]
 name = "android.permission.INTERNET"
 [[package.metadata.android.uses_permission]]
@@ -79,6 +103,14 @@ name = "android.permission.ACCESS_NETWORK_STATE"
 # runtime permission, but required to see the link state on the Link page.
 [[package.metadata.android.uses_permission]]
 name = "android.permission.ACCESS_WIFI_STATE"
+
+# Driving the adapter needs no permission at all - the user grants access to
+# one device at a time through the system dialog - but it does need the phone
+# to be a USB host. Marked required so a device without OTG is not offered an
+# install of an app whose whole point it cannot do.
+[[package.metadata.android.uses_feature]]
+name = "android.hardware.usb.host"
+required = true
 
 [profile.dev]
 opt-level = 1
@@ -89,3 +121,11 @@ opt-level = 1
 # optimization even in a dev build.
 [profile.dev.package."*"]
 opt-level = 3
+
+[dev-dependencies]
+serde_json = "1"
+
+[build-dependencies]
+cc = "1"
+cmake = "0.1"
+pkg-config = "0.3"

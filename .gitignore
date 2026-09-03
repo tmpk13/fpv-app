@@ -6,6 +6,10 @@ target
 # Local working notes
 NOTES.md
 
+# The ground station key. Never commit one: it is the shared secret the whole
+# link rests on, and a copy in git history is a copy that cannot be revoked.
+*.key
+
 # APKs and their signing sidecars, from `x run` / `cargo apk`
 *.apk
 *.idsig

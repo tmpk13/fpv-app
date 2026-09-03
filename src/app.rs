@@ -8,7 +8,9 @@
 use std::time::Instant;
 
 use crate::config::{AppConfig, UiSettings};
-use crate::video::{Codec, Frame, Source, Stats, VideoHandle};
+use crate::video::{
+    Bandwidth, Codec, Frame, RadioSettings, Source, SourceKind, Stats, UdpSettings, VideoHandle,
+};
 
 /// The view layer. Kept in a submodule so this file holds only state and the
 /// core update logic; the `impl DroneApp` blocks there render each page.
@@ -97,8 +99,17 @@ pub struct DroneApp {
 /// port is not a number, and forcing it through one as it is entered either
 /// rejects the keystroke or silently rewrites it.
 pub struct Draft {
+    pub kind: SourceKind,
+    /// Radio.
+    pub channel: String,
+    pub bandwidth: Bandwidth,
+    pub link_id: String,
+    pub radio_port: String,
+    pub key_path: String,
+    /// Forwarded RTP.
     pub bind: String,
     pub port: String,
+    /// Both.
     pub codec: Option<Codec>,
     pub fill: bool,
     pub overlay: bool,
@@ -109,8 +120,14 @@ pub struct Draft {
 impl Draft {
     fn from_config(config: &AppConfig) -> Self {
         Self {
-            bind: config.source.bind.to_string(),
-            port: config.source.port.to_string(),
+            kind: config.source.kind,
+            channel: config.source.radio.channel.to_string(),
+            bandwidth: config.source.radio.bandwidth,
+            link_id: config.source.radio.link_id.to_string(),
+            radio_port: config.source.radio.radio_port.to_string(),
+            key_path: config.source.radio.key_path.display().to_string(),
+            bind: config.source.udp.bind.to_string(),
+            port: config.source.udp.port.to_string(),
             codec: config.source.codec,
             fill: config.video.fill,
             overlay: config.video.overlay,
@@ -119,8 +136,11 @@ impl Draft {
         }
     }
 
-    /// The source this draft describes, or an explanation of why it is not one
-    /// yet.
+    /// The source this draft describes, or an explanation of why it is not
+    /// one yet.
+    ///
+    /// Both halves are parsed whichever is selected, so switching to the
+    /// other one does not turn out to have kept an unusable value.
     pub(crate) fn to_source(&self) -> Result<Source, String> {
         let bind = self
             .bind
@@ -135,9 +155,44 @@ impl Draft {
         if port == 0 {
             return Err("port 0 asks the system to choose one, which nothing can send to".into());
         }
+
+        let channel = self
+            .channel
+            .trim()
+            .parse::<u8>()
+            .ok()
+            .filter(|c| *c > 0)
+            .ok_or_else(|| format!("\"{}\" is not a channel number", self.channel.trim()))?;
+        let link_id = self
+            .link_id
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| format!("\"{}\" is not a link id", self.link_id.trim()))?;
+        // The link id is 24 bits: the channel id it goes into is that plus an
+        // 8-bit radio port. A larger number would silently lose its top bits
+        // and match nothing, with every frame discarded and no explanation.
+        if link_id > 0x00ff_ffff {
+            return Err("a link id is at most 16777215".into());
+        }
+        let radio_port = self
+            .radio_port
+            .trim()
+            .parse::<u8>()
+            .map_err(|_| format!("\"{}\" is not a radio port", self.radio_port.trim()))?;
+        if self.key_path.trim().is_empty() {
+            return Err("a key file is needed to decrypt the link".into());
+        }
+
         Ok(Source {
-            bind,
-            port,
+            kind: self.kind,
+            radio: RadioSettings {
+                channel,
+                bandwidth: self.bandwidth,
+                link_id,
+                radio_port,
+                key_path: std::path::PathBuf::from(self.key_path.trim()),
+            },
+            udp: UdpSettings { bind, port },
             codec: self.codec,
         })
     }
@@ -149,7 +204,7 @@ impl DroneApp {
         config: AppConfig,
         insets: Option<Box<dyn Fn() -> [f32; 4]>>,
     ) -> Self {
-        let video = crate::video::spawn(ctx, config.source);
+        let video = crate::video::spawn(ctx, config.source.clone());
         let draft = Draft::from_config(&config);
         Self {
             config,
@@ -263,25 +318,32 @@ impl DroneApp {
             }
         };
 
-        self.config.source = source;
+        let listening = match source.kind {
+            SourceKind::Radio => format!(
+                "Receiving on channel {} {}, link {}",
+                source.radio.channel,
+                source.radio.bandwidth.as_str(),
+                source.radio.link_id
+            ),
+            SourceKind::Udp => format!("Listening on {}:{}", source.udp.bind, source.udp.port),
+        };
+
+        self.config.source = source.clone();
         self.config.video.fill = self.draft.fill;
         self.config.video.overlay = self.draft.overlay;
         self.config.video.smooth = self.draft.smooth;
         self.config.ui.text_scale = self.draft.text_scale;
 
-        // Retune before saving: the socket change is what the user is waiting
-        // to see, and it should not be held up by a file that may not be
-        // writable.
+        // Retune before saving: the change to the link is what the user is
+        // waiting to see, and it should not be held up by a file that may not
+        // be writable.
         self.video.retune(source);
         // A texture built with the old sampling stays as it was until it is
         // replaced, so drop it and let the next frame rebuild it.
         self.texture = None;
 
         self.save_result = Some(match self.config.save() {
-            Ok(()) => Ok(format!(
-                "Saved. Listening on {}:{}",
-                source.bind, source.port
-            )),
+            Ok(()) => Ok(format!("Saved. {listening}")),
             Err(err) => Err(format!("Applied, but not saved: {err}")),
         });
     }

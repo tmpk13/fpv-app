@@ -10,10 +10,21 @@
 //!
 //! ```toml
 //! [source]
+//! kind = "radio"      # "radio" to drive the adapter here, "udp" to take
+//!                     # RTP another machine's wfb_rx already unpacked
+//! codec = "auto"      # "auto", "h264" or "h265"
+//!
+//! [source.radio]
+//! channel = 161       # must match the air unit
+//! bandwidth = 20      # 20 or 40 MHz
+//! link_id = 7669206   # must match the air unit's `wfb_tx -i`
+//! radio_port = 0      # the wfb-ng port carrying video
+//! key = "gs.key"      # relative paths are resolved beside this file
+//!
+//! [source.udp]
 //! bind = "0.0.0.0"    # "0.0.0.0" to receive from the network, "127.0.0.1"
 //!                     # when wfb_rx runs on this machine
 //! port = 5600         # the port drone-cam's `wfb_rx -u` unpacks video to
-//! codec = "auto"      # "auto", "h264" or "h265"
 //!
 //! [video]
 //! fill = false        # crop to fill the window rather than fitting inside it
@@ -35,7 +46,7 @@ use egui::Color32;
 use serde::Deserialize;
 use toml_edit::{DocumentMut, Item, Table, Value};
 
-use crate::video::{Codec, Source};
+use crate::video::{Bandwidth, Codec, RadioSettings, Source, SourceKind, UdpSettings};
 
 /// The file the app reads and the Settings page writes.
 pub const CONFIG_FILE: &str = "drone-app.toml";
@@ -117,9 +128,31 @@ struct RawConfig {
 
 #[derive(Debug, Default, Deserialize)]
 struct RawSource {
+    kind: Option<String>,
+    codec: Option<String>,
+    #[serde(default)]
+    radio: RawRadio,
+    #[serde(default)]
+    udp: RawUdp,
+    // Accepted where `[source.udp]` now lives, so a config written by the
+    // version before the radio existed still works unchanged.
     bind: Option<String>,
     port: Option<u16>,
-    codec: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawRadio {
+    channel: Option<u8>,
+    bandwidth: Option<u32>,
+    link_id: Option<u32>,
+    radio_port: Option<u8>,
+    key: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawUdp {
+    bind: Option<String>,
+    port: Option<u16>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -195,9 +228,19 @@ impl AppConfig {
     /// Apply this config's values to an existing document.
     fn write_into(&self, doc: &mut DocumentMut) {
         let source = section(doc, "source");
-        source["bind"] = value(self.source.bind.to_string());
-        source["port"] = value(i64::from(self.source.port));
+        source["kind"] = value(self.source.kind.as_str().to_string());
         source["codec"] = value(codec_name(self.source.codec).to_string());
+
+        let radio = subsection(doc, "source", "radio");
+        radio["channel"] = value(i64::from(self.source.radio.channel));
+        radio["bandwidth"] = value(i64::from(self.source.radio.bandwidth.mhz()));
+        radio["link_id"] = value(i64::from(self.source.radio.link_id));
+        radio["radio_port"] = value(i64::from(self.source.radio.radio_port));
+        radio["key"] = value(self.source.radio.key_path.display().to_string());
+
+        let udp = subsection(doc, "source", "udp");
+        udp["bind"] = value(self.source.udp.bind.to_string());
+        udp["port"] = value(i64::from(self.source.udp.port));
 
         let video = section(doc, "video");
         video["fill"] = value(self.video.fill);
@@ -223,13 +266,30 @@ impl AppConfig {
              # place, so comments and key order here survive being saved.\n\
              \n\
              [source]\n\
+             # \"radio\" drives the adapter on this machine and receives the\n\
+             # link itself. \"udp\" takes RTP another machine's wfb_rx has\n\
+             # already decrypted and forwarded.\n\
+             kind = \"{kind}\"\n\
+             # \"auto\", \"h264\" or \"h265\". Auto reads it off the stream.\n\
+             codec = \"{codec}\"\n\
+             \n\
+             [source.radio]\n\
+             # All four must match the air unit. `sudo ./vrx.sh scan` in the\n\
+             # drone-cam checkout reads the channel and link id off the air.\n\
+             channel = {channel}\n\
+             bandwidth = {bandwidth}\n\
+             link_id = {link_id}\n\
+             radio_port = {radio_port}\n\
+             # The ground station half of the wfb_keygen pair. A relative path\n\
+             # is resolved beside this file.\n\
+             key = \"{key}\"\n\
+             \n\
+             [source.udp]\n\
              # \"0.0.0.0\" receives from anywhere on the network, which is what\n\
-             # the phone needs. \"127.0.0.1\" is enough when wfb_rx runs here.\n\
+             # a phone needs. \"127.0.0.1\" is enough when wfb_rx runs here.\n\
              bind = \"{bind}\"\n\
              # The port drone-cam's `wfb_rx -u` unpacks video to.\n\
              port = {port}\n\
-             # \"auto\", \"h264\" or \"h265\". Auto reads it off the stream.\n\
-             codec = \"{codec}\"\n\
              \n\
              [video]\n\
              # Crop to fill the window rather than fitting the whole picture.\n\
@@ -248,9 +308,15 @@ impl AppConfig {
              text = \"{text}\"\n\
              # Multiplier on the page text; 1.0 is the default size.\n\
              text_scale = {text_scale}\n",
-            bind = self.source.bind,
-            port = self.source.port,
+            kind = self.source.kind.as_str(),
             codec = codec_name(self.source.codec),
+            channel = self.source.radio.channel,
+            bandwidth = self.source.radio.bandwidth.mhz(),
+            link_id = self.source.radio.link_id,
+            radio_port = self.source.radio.radio_port,
+            key = self.source.radio.key_path.display(),
+            bind = self.source.udp.bind,
+            port = self.source.udp.port,
             fill = self.video.fill,
             overlay = self.video.overlay,
             smooth = self.video.smooth,
@@ -262,6 +328,22 @@ impl AppConfig {
             text_scale = self.ui.text_scale,
         )
     }
+
+    /// Resolve a relative key file against `base`.
+    ///
+    /// Where `base` is depends on the platform and only the caller knows it.
+    /// On a desktop it is the config file's own directory, so `gs.key` beside
+    /// `drone-app.toml` works and the pair travel together. On Android it is
+    /// the app's external files directory, because that is the only place a
+    /// file can be put from outside the app without a storage permission, and
+    /// it is nowhere near the config.
+    ///
+    /// An absolute path is left alone: someone who wrote one meant it.
+    pub fn resolve_key_path(&mut self, base: impl AsRef<Path>) {
+        if self.source.radio.key_path.is_relative() {
+            self.source.radio.key_path = base.as_ref().join(&self.source.radio.key_path);
+        }
+    }
 }
 
 impl RawConfig {
@@ -269,12 +351,62 @@ impl RawConfig {
         let defaults = AppConfig::default();
         AppConfig {
             source: Source {
-                bind: self
-                    .source
-                    .bind
-                    .and_then(|s| s.trim().parse().ok())
-                    .unwrap_or(defaults.source.bind),
-                port: self.source.port.unwrap_or(defaults.source.port),
+                kind: match self.source.kind.as_deref().map(str::trim) {
+                    Some("udp") => SourceKind::Udp,
+                    Some("radio") => SourceKind::Radio,
+                    // Anything unrecognized, including nothing at all, drives
+                    // the radio: that is what the app is for, and a config
+                    // written before the radio existed named no kind.
+                    _ => defaults.source.kind,
+                },
+                radio: RadioSettings {
+                    channel: self
+                        .source
+                        .radio
+                        .channel
+                        .filter(|c| *c > 0)
+                        .unwrap_or(defaults.source.radio.channel),
+                    bandwidth: self
+                        .source
+                        .radio
+                        .bandwidth
+                        .map(Bandwidth::from_mhz)
+                        .unwrap_or(defaults.source.radio.bandwidth),
+                    link_id: self
+                        .source
+                        .radio
+                        .link_id
+                        .unwrap_or(defaults.source.radio.link_id),
+                    radio_port: self
+                        .source
+                        .radio
+                        .radio_port
+                        .unwrap_or(defaults.source.radio.radio_port),
+                    key_path: self
+                        .source
+                        .radio
+                        .key
+                        .map(PathBuf::from)
+                        .unwrap_or(defaults.source.radio.key_path),
+                },
+                udp: UdpSettings {
+                    // The pre-radio schema put these directly under [source];
+                    // that spelling still wins if the newer one is absent, so
+                    // an existing config file keeps working.
+                    bind: self
+                        .source
+                        .udp
+                        .bind
+                        .or(self.source.bind)
+                        .and_then(|s| s.trim().parse().ok())
+                        .unwrap_or(defaults.source.udp.bind),
+                    port: self
+                        .source
+                        .udp
+                        .port
+                        .or(self.source.port)
+                        .unwrap_or(defaults.source.udp.port),
+                },
                 codec: self.source.codec.as_deref().and_then(parse_codec),
             },
             video: VideoSettings {
@@ -364,6 +496,19 @@ fn section<'a>(doc: &'a mut DocumentMut, name: &str) -> &'a mut Item {
     &mut doc[name]
 }
 
+/// A `[parent.child]` table, created if it is not there.
+///
+/// Written as a nested table rather than a dotted key so a hand-edited file
+/// that already spells it `[source.radio]` is updated in place instead of
+/// gaining a second copy of every key.
+fn subsection<'a>(doc: &'a mut DocumentMut, parent: &str, name: &str) -> &'a mut Item {
+    let parent = section(doc, parent);
+    if parent.get(name).is_none() {
+        parent[name] = Item::Table(Table::new());
+    }
+    &mut parent[name]
+}
+
 /// Wrap a value so it can be assigned into a document.
 fn value(v: impl Into<Value>) -> Item {
     Item::Value(v.into())
@@ -386,9 +531,19 @@ mod tests {
     fn reads_a_full_document() {
         let text = r##"
             [source]
+            kind = "udp"
+            codec = "h264"
+
+            [source.radio]
+            channel = 149
+            bandwidth = 40
+            link_id = 12345
+            radio_port = 2
+            key = "/tmp/gs.key"
+
+            [source.udp]
             bind = "127.0.0.1"
             port = 5602
-            codec = "h264"
 
             [video]
             fill = true
@@ -400,8 +555,14 @@ mod tests {
             text_scale = 1.5
         "##;
         let config = toml::from_str::<RawConfig>(text).unwrap().into_config();
-        assert_eq!(config.source.bind, Ipv4Addr::LOCALHOST);
-        assert_eq!(config.source.port, 5602);
+        assert_eq!(config.source.kind, SourceKind::Udp);
+        assert_eq!(config.source.udp.bind, Ipv4Addr::LOCALHOST);
+        assert_eq!(config.source.udp.port, 5602);
+        assert_eq!(config.source.radio.channel, 149);
+        assert_eq!(config.source.radio.bandwidth, Bandwidth::Mhz40);
+        assert_eq!(config.source.radio.link_id, 12345);
+        assert_eq!(config.source.radio.radio_port, 2);
+        assert_eq!(config.source.radio.key_path, PathBuf::from("/tmp/gs.key"));
         assert_eq!(config.source.codec, Some(Codec::H264));
         assert!(config.video.fill);
         assert!(!config.video.overlay);
@@ -470,10 +631,44 @@ mod tests {
 
     #[test]
     fn a_malformed_bind_address_falls_back_to_the_default() {
-        let config = toml::from_str::<RawConfig>("[source]\nbind = \"not an address\"")
+        let config = toml::from_str::<RawConfig>("[source.udp]\nbind = \"not an address\"")
             .unwrap()
             .into_config();
-        assert_eq!(config.source.bind, Source::default().bind);
+        assert_eq!(config.source.udp.bind, Source::default().udp.bind);
+    }
+
+    #[test]
+    fn a_config_from_before_the_radio_still_works() {
+        // The old schema put bind and port directly under [source] and had no
+        // kind at all. Reading one of those must not silently move the app to
+        // a port it was never told about.
+        let text = "[source]\nbind = \"127.0.0.1\"\nport = 5605\ncodec = \"h265\"\n";
+        let config = toml::from_str::<RawConfig>(text).unwrap().into_config();
+        assert_eq!(config.source.udp.bind, Ipv4Addr::LOCALHOST);
+        assert_eq!(config.source.udp.port, 5605);
+        assert_eq!(config.source.codec, Some(Codec::H265));
+        // With no kind named, the radio is what the app is for.
+        assert_eq!(config.source.kind, SourceKind::Radio);
+    }
+
+    #[test]
+    fn a_relative_key_file_is_resolved_against_the_base_given() {
+        let mut config = AppConfig::default();
+        config.source.radio.key_path = PathBuf::from("gs.key");
+        config.resolve_key_path("/etc/drone");
+        assert_eq!(
+            config.source.radio.key_path,
+            PathBuf::from("/etc/drone/gs.key"),
+            "a key file named beside the config must be found beside it"
+        );
+
+        // An absolute path is left alone, and resolving twice is a no-op -
+        // which matters because the Android path calls this after load.
+        config.resolve_key_path("/somewhere/else");
+        assert_eq!(
+            config.source.radio.key_path,
+            PathBuf::from("/etc/drone/gs.key")
+        );
     }
 
     #[test]
@@ -489,7 +684,7 @@ mod tests {
         let mut doc = original.parse::<DocumentMut>().unwrap();
 
         let mut config = AppConfig::default();
-        config.source.port = 5700;
+        config.source.udp.port = 5700;
         config.write_into(&mut doc);
 
         let saved = doc.to_string();
@@ -505,7 +700,9 @@ mod tests {
     #[test]
     fn the_generated_template_parses_back_to_what_wrote_it() {
         let mut config = AppConfig::default();
-        config.source.port = 5601;
+        config.source.udp.port = 5601;
+        config.source.radio.channel = 149;
+        config.source.radio.link_id = 424242;
         config.source.codec = Some(Codec::H265);
         config.video.fill = true;
         config.ui.text_scale = 1.25;

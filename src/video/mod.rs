@@ -1,10 +1,15 @@
-//! The video path: a UDP port in, decoded frames and link statistics out.
+//! The video path: packets in, decoded frames and link statistics out.
 //!
 //! The shape is the one gps-gui-rs uses for its GPS and BLE sources: a
 //! background thread produces, the UI drains each frame, and the platform
 //! difference is confined to one submodule. Here that difference is the
 //! decoder - GStreamer on desktop, `AMediaCodec` on Android - and everything
 //! ahead of it ([`rtp`], [`codec`]) is shared and unit-tested.
+//!
+//! Where the packets come from is a second choice, made in [`source`]: the
+//! radio, driven here through devourer and the wfb-ng link layer, or a UDP
+//! port carrying RTP another machine has already unpacked. Both hand the loop
+//! below the same thing, so nothing past this file knows which is in use.
 //!
 //! Frames reach the UI through a single-slot mailbox rather than a channel,
 //! which is the one place this differs from the GPS source. A channel keeps
@@ -14,20 +19,20 @@
 //! rest, so a slow frame costs a dropped picture instead of permanent latency.
 //!
 //! ```text
-//! udp/5600 --> Receiver thread --> Depayloader --> Decoder --> FrameSink
-//!                  |                   |                          |
-//!              rate stats          loss stats               latest frame
-//!                  \___________________|__________________________/
-//!                                      v
-//!                                 Stats + mailbox --> egui
+//! radio or udp --> Receiver thread --> Depayloader --> Decoder --> FrameSink
+//!                       |                   |                         |
+//!                   rate stats          loss stats              latest frame
+//!                       \___________________|_________________________/
+//!                                           v
+//!                                     Stats + mailbox --> egui
 //! ```
 
 pub mod codec;
 mod decode;
 pub mod rtp;
+pub mod source;
 pub mod yuv;
 
-use std::net::UdpSocket;
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -35,9 +40,14 @@ use std::time::{Duration, Instant};
 
 pub use codec::Codec;
 pub use rtp::RtpStats;
+pub use source::{Bandwidth, RadioSettings, Source, SourceKind, UdpSettings};
 
 use codec::Detector;
 use rtp::Depayloader;
+use source::{PacketSource, UdpSource};
+
+#[cfg(feature = "radio")]
+use crate::radio::RadioStats;
 
 /// Largest UDP datagram accepted. wfb-ng emits RTP inside a 1500-byte MTU, so
 /// this has plenty of headroom while still bounding the read buffer.
@@ -64,7 +74,7 @@ pub struct Frame {
 }
 
 /// Everything the Link page reports.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Stats {
     /// What the RTP layer saw.
     pub rtp: RtpStats,
@@ -89,40 +99,21 @@ pub struct Stats {
     /// problem, and telling those apart from the picture alone is impossible.
     pub since_packet_s: Option<f64>,
     pub since_frame_s: Option<f64>,
-    /// Set when the socket could not be bound, which is the one failure that
-    /// leaves nothing else to report.
-    pub bind_error: Option<&'static str>,
+    /// Why nothing is arriving, when the source itself knows: a port that
+    /// would not bind, an adapter that is not there, a key file that is not
+    /// readable. The one class of failure that leaves nothing else to report.
+    pub fault: Option<String>,
+    /// What the radio and the wfb-ng link layer saw. `None` when the source
+    /// is a UDP port, because then this machine is not the ground station and
+    /// has no way to know any of it.
+    #[cfg(feature = "radio")]
+    pub radio: Option<RadioStats>,
 }
 
 impl Stats {
     /// Whether video is arriving and decoding right now.
     pub fn live(&self) -> bool {
         self.since_frame_s.is_some_and(|s| s < 2.0)
-    }
-}
-
-/// The bind address and decode settings the receive thread runs with.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Source {
-    /// Address to bind. `0.0.0.0` receives from anywhere on the network, which
-    /// is what the phone needs; `127.0.0.1` is enough when wfb_rx is on the
-    /// same machine.
-    pub bind: std::net::Ipv4Addr,
-    pub port: u16,
-    /// Force a codec instead of detecting one. Detection costs a few packets
-    /// at startup and is right every time in practice, so this is for pinning
-    /// the answer when a stream is known to be misclassified.
-    pub codec: Option<Codec>,
-}
-
-impl Default for Source {
-    fn default() -> Self {
-        Self {
-            // The port drone-cam's `wfb_rx -u` unpacks video to.
-            bind: std::net::Ipv4Addr::UNSPECIFIED,
-            port: 5600,
-            codec: None,
-        }
     }
 }
 
@@ -153,19 +144,19 @@ impl VideoHandle {
     }
 
     pub fn stats(&self) -> Stats {
-        self.stats.lock().map(|s| *s).unwrap_or_default()
+        self.stats.lock().map(|s| s.clone()).unwrap_or_default()
     }
 
-    pub fn source(&self) -> Source {
-        self.source
+    pub fn source(&self) -> &Source {
+        &self.source
     }
 
-    /// Point the receiver at a different address, or a different forced codec.
+    /// Point the receiver at a different source, or a different forced codec.
     pub fn retune(&mut self, source: Source) {
         if source == self.source {
             return;
         }
-        self.source = source;
+        self.source = source.clone();
         let _ = self.commands.send(Command::Retune(source));
     }
 
@@ -252,6 +243,7 @@ pub fn spawn(ctx: egui::Context, source: Source) -> VideoHandle {
         frame_window: Arc::new(Mutex::new(Vec::new())),
     };
 
+    let handle_source = source.clone();
     thread::Builder::new()
         .name("video-rx".into())
         .spawn(move || receive_loop(source, sink, rx))
@@ -261,27 +253,28 @@ pub fn spawn(ctx: egui::Context, source: Source) -> VideoHandle {
         mailbox,
         stats,
         commands: tx,
-        source,
+        source: handle_source,
     }
 }
 
-/// Bind, receive, depayload, decode. Runs until the command channel closes,
-/// which happens when the app drops its handle.
+/// Receive, depayload, decode. Runs until the command channel closes, which
+/// happens when the app drops its handle.
 fn receive_loop(mut source: Source, sink: FrameSink, commands: Receiver<Command>) {
-    let mut socket = bind(source, &sink);
+    let mut input = open(&source);
     let mut session = Session::new(source.codec);
-    let mut buf = vec![0u8; MAX_DATAGRAM];
+    let mut scratch = vec![0u8; MAX_DATAGRAM];
     let mut rates = RateWindow::default();
     let mut last_packet: Option<Instant> = None;
     let mut last_frame_seen = 0u64;
     let mut last_frame_at: Option<Instant> = None;
     let mut session_started = Instant::now();
+    let mut last_retry = Instant::now();
 
     loop {
         match commands.try_recv() {
             Ok(Command::Retune(next)) => {
                 source = next;
-                socket = bind(source, &sink);
+                input = open(&source);
                 session = Session::new(source.codec);
                 rates = RateWindow::default();
                 last_packet = None;
@@ -300,26 +293,21 @@ fn receive_loop(mut source: Source, sink: FrameSink, commands: Receiver<Command>
             Err(TryRecvError::Empty) => {}
         }
 
-        let Some(sock) = socket.as_ref() else {
-            // The bind failed. Wait out the timeout, then try again: the port
-            // is usually held by something that is about to exit.
-            thread::sleep(RECV_TIMEOUT);
-            socket = bind(source, &sink);
-            continue;
+        // The borrow of both `input` and `scratch` lasts as long as the
+        // packet does, so everything that touches it happens in here.
+        let arrived = match input.recv(&mut scratch, RECV_TIMEOUT) {
+            Some(packet) => {
+                rates.record(packet.len());
+                session.feed(packet, &sink);
+                true
+            }
+            None => false,
         };
-
-        match sock.recv(&mut buf) {
-            Ok(len) => {
-                last_packet = Some(Instant::now());
-                rates.record(len);
-                session.feed(&buf[..len], &sink);
-            }
-            Err(err) if would_block(&err) => {}
-            Err(err) => {
-                log::warn!("video socket error: {err}");
-                thread::sleep(RECV_TIMEOUT);
-            }
+        if arrived {
+            last_packet = Some(Instant::now());
         }
+
+        let fault = input.fault();
 
         // The rate figures and the two "seconds since" clocks have to keep
         // moving while nothing is arriving - that silence is the reading.
@@ -338,6 +326,22 @@ fn receive_loop(mut source: Source, sink: FrameSink, commands: Receiver<Command>
                 last_frame_at = Some(Instant::now());
             }
             stats.since_frame_s = last_frame_at.map(|t| t.elapsed().as_secs_f64());
+            stats.fault = fault.clone();
+            #[cfg(feature = "radio")]
+            {
+                stats.radio = input.radio_stats();
+            }
+        }
+
+        // A source that never opened, or that has stopped, is retried rather
+        // than left broken: a port is usually held by something about to
+        // exit, and an adapter is usually about to be plugged back in.
+        if fault.is_some() && last_retry.elapsed() > RETRY_INTERVAL {
+            last_retry = Instant::now();
+            log::info!("video: reopening the source");
+            input = open(&source);
+            session = Session::new(source.codec);
+            session_started = Instant::now();
         }
 
         // Packets arriving with no pictures coming out means the decoder is
@@ -350,6 +354,27 @@ fn receive_loop(mut source: Source, sink: FrameSink, commands: Receiver<Command>
             session_started = Instant::now();
             last_frame_at = None;
         }
+    }
+}
+
+/// How long to wait before reopening a source that failed.
+///
+/// Long enough that a missing adapter does not mean a USB reset every quarter
+/// second, short enough that plugging one in is noticed while the user is
+/// still looking at the screen.
+const RETRY_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Build the source the settings describe.
+fn open(source: &Source) -> Box<dyn PacketSource> {
+    match source.kind {
+        #[cfg(feature = "radio")]
+        SourceKind::Radio => Box::new(source::RadioSource::new(&source.radio)),
+        // Without the radio feature there is no adapter to open, so the
+        // setting falls back to the port rather than reporting a fault the
+        // user cannot fix from this build.
+        #[cfg(not(feature = "radio"))]
+        SourceKind::Radio => Box::new(UdpSource::new(source.udp, RECV_TIMEOUT)),
+        SourceKind::Udp => Box::new(UdpSource::new(source.udp, RECV_TIMEOUT)),
     }
 }
 
@@ -389,48 +414,6 @@ fn stalled(
         // Nothing has ever decoded, so the session's own age is the clock.
         None => since_session > STALL_TIMEOUT,
     }
-}
-
-/// Bind the receive socket, recording a failure in the stats rather than
-/// returning it.
-fn bind(source: Source, sink: &FrameSink) -> Option<UdpSocket> {
-    let result = UdpSocket::bind((source.bind, source.port))
-        .and_then(|s| s.set_read_timeout(Some(RECV_TIMEOUT)).map(|()| s));
-
-    let (socket, error) = match result {
-        Ok(socket) => {
-            log::info!("video: listening on {}:{}", source.bind, source.port);
-            (Some(socket), None)
-        }
-        Err(err) => {
-            log::error!("video: cannot bind {}:{}: {err}", source.bind, source.port);
-            // A borrowed message would have to outlive the error; the three
-            // cases worth telling apart are these.
-            let reason = match err.kind() {
-                std::io::ErrorKind::AddrInUse => "port already in use",
-                std::io::ErrorKind::PermissionDenied => "permission denied",
-                _ => "cannot bind the port",
-            };
-            (None, Some(reason))
-        }
-    };
-
-    if let Ok(mut stats) = sink.stats.lock() {
-        stats.bind_error = error;
-    }
-    socket
-}
-
-/// Whether a socket error is just the read timeout expiring.
-///
-/// Both kinds are checked because the platforms disagree: a timed-out `recv`
-/// is `WouldBlock` on Unix and `TimedOut` on Windows, and treating either as a
-/// real error would log a warning four times a second on an idle link.
-fn would_block(err: &std::io::Error) -> bool {
-    matches!(
-        err.kind(),
-        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-    )
 }
 
 /// One stream: the codec vote, the depayloader and the decoder built for it.

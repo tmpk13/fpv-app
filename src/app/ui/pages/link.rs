@@ -36,6 +36,8 @@ impl DroneApp {
                 plot::link_history(ui, &history, HISTORY_S, settings.ok, settings.error);
                 gap(ui, GAP_BLOCK);
 
+                self.radio_readings(ui, stats, &settings);
+
                 section(ui, "Stream", None);
                 reading(
                     ui,
@@ -108,6 +110,144 @@ impl DroneApp {
                 }
             });
         });
+    }
+
+    /// The radio and wfb-ng sections, when this device is the ground station.
+    ///
+    /// Absent on a forwarded stream, because then none of it is knowable
+    /// here: the machine running `wfb_rx` has the radio, and everything on
+    /// this page below is what survived being sent on from it.
+    #[cfg(feature = "radio")]
+    fn radio_readings(
+        &self,
+        ui: &mut egui::Ui,
+        stats: &Stats,
+        settings: &crate::config::UiSettings,
+    ) {
+        let Some(radio) = stats.radio.as_ref() else {
+            return;
+        };
+        let link = &radio.link;
+
+        section(ui, "Radio", None);
+        reading(ui, "Adapter", &radio.chip, None);
+        reading(
+            ui,
+            "Signal",
+            &radio
+                .signal
+                .rssi_dbm
+                .map_or_else(|| "-".to_string(), |dbm| format!("{dbm} dBm")),
+            radio.signal.rssi_dbm.map(|dbm| signal_color(dbm, settings)),
+        );
+        reading(
+            ui,
+            "Signal to noise",
+            &radio
+                .signal
+                .snr_db
+                .map_or_else(|| "-".to_string(), |db| format!("{db} dB")),
+            None,
+        );
+        reading(
+            ui,
+            "Noise floor",
+            &radio
+                .signal
+                .noise_dbm
+                .map_or_else(|| "-".to_string(), |dbm| format!("{dbm} dBm")),
+            None,
+        );
+        reading(ui, "Antennas", &antennas(&radio.signal), None);
+        // The two frame counts together are the diagnostic: traffic with none
+        // of it ours is a link id that does not match, and no traffic at all
+        // is the wrong channel.
+        reading(ui, "Frames heard", &count(link.total_frames), None);
+        reading(
+            ui,
+            "Frames ours",
+            &count(link.frames),
+            (link.total_frames > 0 && link.frames == 0).then_some(settings.error),
+        );
+        reading(ui, "Bad checksum", &count(link.crc_errors), None);
+
+        section(ui, "wfb-ng", None);
+        reading(
+            ui,
+            "Session",
+            &if link.has_session() {
+                format!("FEC {} of {}, epoch {}", link.fec_k, link.fec_n, link.epoch)
+            } else {
+                "none yet".to_string()
+            },
+            (!link.has_session()).then_some(settings.warn),
+        );
+        reading(
+            ui,
+            "Would not decrypt",
+            &count(link.decrypt_errors),
+            (link.decrypt_errors > 0).then_some(settings.warn),
+        );
+        // The number that says how hard the link is working: loss the user
+        // never saw, because the erasure code put it back.
+        reading(
+            ui,
+            "Repaired by FEC",
+            &format!(
+                "{} ({:.2}%)",
+                count(link.agg.recovered),
+                link.recovery_pct()
+            ),
+            Some(loss_color(link.recovery_pct() as f32, settings)),
+        );
+        reading(
+            ui,
+            "Beyond repair",
+            &format!("{} ({:.2}%)", count(link.agg.packets_lost), link.loss_pct()),
+            Some(loss_color(link.loss_pct() as f32, settings)),
+        );
+        reading(ui, "Blocks overrun", &count(link.agg.overrun), None);
+        reading(ui, "Queue drops", &count(radio.queue_drops), None);
+        gap(ui, GAP_BLOCK);
+    }
+
+    #[cfg(not(feature = "radio"))]
+    fn radio_readings(
+        &self,
+        _ui: &mut egui::Ui,
+        _stats: &Stats,
+        _settings: &crate::config::UiSettings,
+    ) {
+    }
+}
+
+/// Per-antenna signal, for telling a dead antenna from a weak link.
+#[cfg(feature = "radio")]
+fn antennas(signal: &crate::radio::Signal) -> String {
+    let readings: Vec<String> = signal
+        .antennas
+        .iter()
+        .filter_map(|dbm| dbm.map(|dbm| format!("{dbm}")))
+        .collect();
+    if readings.is_empty() {
+        return "-".to_string();
+    }
+    format!("{} dBm", readings.join(" / "))
+}
+
+/// The color a signal strength is drawn in.
+///
+/// The thresholds are where an 802.11 link stops having margin rather than
+/// where it stops working: -70 dBm still carries video, and is the point at
+/// which a gust or a turn starts costing frames.
+#[cfg(feature = "radio")]
+fn signal_color(dbm: i32, settings: &crate::config::UiSettings) -> egui::Color32 {
+    if dbm < -80 {
+        settings.error
+    } else if dbm < -70 {
+        settings.warn
+    } else {
+        settings.ok
     }
 }
 

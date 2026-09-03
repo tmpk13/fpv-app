@@ -20,7 +20,17 @@ pub const LINK_RESTART: &str =
 
 /// Settings page.
 pub const SETTINGS_SOURCE_HINT: &str =
-    "Where the RTP stream arrives. These must match what wfb_rx was told to unpack to.";
+    "Radio drives the adapter on this device and receives the link itself. Forwarded takes RTP another machine's wfb_rx has already decrypted.";
+pub const SETTINGS_RADIO_HINT: &str =
+    "All four must match the air unit. In the drone-cam checkout, `sudo ./vrx.sh scan` reads the channel and link id off the air.";
+pub const SETTINGS_CHANNEL_HINT: &str =
+    "The 802.11 channel number, not a frequency. 149 to 165 is the 5.8 GHz band FPV normally uses.";
+pub const SETTINGS_LINK_HINT: &str =
+    "The receiver filters on this and the radio port together, so a wrong value discards every frame and looks exactly like an air unit that is switched off.";
+pub const SETTINGS_KEY_HINT: &str =
+    "The ground station half of the wfb_keygen pair, gs.key. A relative path is resolved beside the config file.";
+pub const SETTINGS_UDP_HINT: &str =
+    "Where the forwarded RTP arrives. These must match what wfb_rx was told to unpack to.";
 pub const SETTINGS_BIND_HINT: &str =
     "0.0.0.0 receives from anywhere on the network. 127.0.0.1 is enough when wfb_rx runs on this machine.";
 pub const SETTINGS_CODEC_HINT: &str =
@@ -85,12 +95,92 @@ pub const NO_FRAMES: &str = "Packets are arriving but nothing is decoding.\n\n\
      the stream may be encrypted with a key this ground station does not have - \
      wfb_rx would report a rising dec_err count.";
 
-/// The socket could not be bound at all.
-pub fn bind_failed(reason: &str, bind: &str, port: u16) -> String {
-    format!(
-        "Cannot listen on {bind}:{port}: {reason}.\n\n\
-         Another copy of this app, or a gst-launch left running, is most likely \
-         holding the port. Change the port on the Settings page to use a \
-         different one."
-    )
+/// The source could not be opened at all.
+///
+/// Two very different failures share this: a socket that would not bind and
+/// an adapter that is not there. The message from the source itself is the
+/// specific half; what follows it is what to do about it.
+pub fn source_failed(reason: &str, radio: bool) -> String {
+    if radio {
+        format!(
+            "{reason}.\n\n\
+             Check that the adapter is plugged in and that it is one this \
+             build can drive - an RTL8812AU, 8814AU or 8812EU. On Linux, \
+             reaching it without root needs a udev rule; on Android, the \
+             permission prompt has to be accepted.\n\n\
+             If the message is about the key file, copy gs.key from the \
+             ground station to the path on the Settings page."
+        )
+    } else {
+        format!(
+            "{reason}.\n\n\
+             Another copy of this app, or a gst-launch left running, is most \
+             likely holding the port. Change the port on the Settings page to \
+             use a different one."
+        )
+    }
+}
+
+/// How far a radio link got before it stopped.
+///
+/// The stages are ordered, and each one has a different fix. A black screen
+/// looks identical for all of them, which is the entire reason this exists:
+/// on a link that is not working, knowing that frames are arriving but none
+/// of them are ours is the difference between a five-second fix and an hour.
+///
+/// Without the radio feature only the last two are reachable - there is no
+/// adapter to be in any of the earlier states - but the prose is kept whole
+/// rather than split across a cfg: it reads as one explanation.
+#[cfg_attr(not(feature = "radio"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RadioStage {
+    /// The adapter is listening and hearing nothing at all.
+    Silent,
+    /// The channel is busy, but none of it carries our link id.
+    NotOurs,
+    /// Our frames are arriving, but no session key has been read from them.
+    NoSession,
+    /// The session is up and packets are being dropped as unreadable.
+    NotDecrypting,
+    /// Packets are flowing and the decoder is producing nothing.
+    NotDecoding,
+    /// It was working and has stopped.
+    Stopped(f64),
+}
+
+/// What to say about a radio link with no picture.
+pub fn radio_no_video(stage: RadioStage, channel: u8, width: &str, link_id: u32) -> String {
+    match stage {
+        RadioStage::Silent => format!(
+            "Listening on channel {channel} at {width}, and the band is \n\
+             completely quiet.\n\n\
+             Either the air unit is not transmitting, or it is on another \
+             channel. Check that it has power, and that the channel here \
+             matches the one it was flashed with."
+        ),
+        RadioStage::NotOurs => format!(
+            "Channel {channel} is busy, but none of the traffic is ours.\n\n\
+             The adapter and the channel are right; the link id is not. This \
+             one is set to {link_id}. In the drone-cam checkout, \n\
+             `sudo ./vrx.sh scan` reads the id off the air."
+        ),
+        RadioStage::NoSession => "Our frames are arriving, but none of them opens.\n\n\
+             The air unit is transmitting and the link id matches, so what is \
+             left is the key: this ground station has a gs.key that is not \
+             the peer of the drone.key the air unit was flashed with. Copy \
+             the pair from the ground station that works."
+            .to_string(),
+        RadioStage::NotDecrypting => {
+            "The session is up but the video packets are being rejected.\n\n\
+             Usually two air units on one link id, or a key that changed \
+             without this end being restarted."
+                .to_string()
+        }
+        RadioStage::NotDecoding => NO_FRAMES.to_string(),
+        RadioStage::Stopped(seconds) => format!(
+            "The link went quiet {seconds:.0} s ago.\n\n\
+             The air unit may have lost power or flown out of range. This \
+             page picks the stream back up on its own when it returns."
+        ),
+    }
 }

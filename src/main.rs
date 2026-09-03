@@ -11,7 +11,10 @@ fn main() -> eframe::Result<()> {
     // Beside the working directory, which for a ground station is the checkout
     // the app was started from. Android puts it in the app's data dir instead
     // (see lib.rs), that being the only writable place there.
-    let config = AppConfig::load(CONFIG_FILE);
+    let mut config = AppConfig::load(CONFIG_FILE);
+    // A key file named without a directory sits beside the config, so a
+    // checkout can carry both and be moved as one.
+    config.resolve_key_path(".");
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

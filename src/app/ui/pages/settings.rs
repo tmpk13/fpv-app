@@ -8,7 +8,7 @@
 //! commit and others do not is worse than one where none do.
 
 use crate::app::{DroneApp, SafeArea};
-use crate::video::Codec;
+use crate::video::{Bandwidth, Codec, SourceKind};
 
 use super::super::text;
 use super::super::theme::{field_width, gap, GAP_BLOCK, GAP_SECTION};
@@ -41,22 +41,19 @@ impl DroneApp {
                 section(ui, "Source", Some(text::SETTINGS_SOURCE_HINT));
 
                 ui.horizontal(|ui| {
-                    ui.label("Listen on");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.draft.bind)
-                            .desired_width(field)
-                            .hint_text("0.0.0.0"),
-                    )
-                    .on_hover_text(text::SETTINGS_BIND_HINT);
+                    ui.selectable_value(&mut self.draft.kind, SourceKind::Radio, "Radio");
+                    ui.selectable_value(&mut self.draft.kind, SourceKind::Udp, "Forwarded");
                 });
-                ui.horizontal(|ui| {
-                    ui.label("Port");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.draft.port)
-                            .desired_width(field * 0.5)
-                            .hint_text("5600"),
-                    );
-                });
+
+                // Both sets are always shown. Hiding the unselected one saves
+                // a few lines of screen and costs the ability to check the
+                // other half before switching to it, which on a link that is
+                // not working is exactly what a user is doing here.
+                gap(ui, GAP_BLOCK);
+                match self.draft.kind {
+                    SourceKind::Radio => self.radio_fields(ui, field),
+                    SourceKind::Udp => self.udp_fields(ui, field),
+                }
 
                 gap(ui, GAP_BLOCK);
                 ui.horizontal(|ui| {
@@ -110,6 +107,87 @@ impl DroneApp {
                     );
                 }
             });
+        });
+    }
+
+    /// The four values that have to match the air unit, and the key.
+    fn radio_fields(&mut self, ui: &mut egui::Ui, field: f32) {
+        ui.label(
+            egui::RichText::new(text::SETTINGS_RADIO_HINT)
+                .weak()
+                .small(),
+        );
+        gap(ui, GAP_BLOCK);
+
+        ui.horizontal(|ui| {
+            ui.label("Channel");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.draft.channel)
+                    .desired_width(field * 0.4)
+                    .hint_text("161"),
+            )
+            .on_hover_text(text::SETTINGS_CHANNEL_HINT);
+
+            egui::ComboBox::from_id_salt("bandwidth")
+                .selected_text(self.draft.bandwidth.as_str())
+                .show_ui(ui, |ui| {
+                    for option in [Bandwidth::Mhz20, Bandwidth::Mhz40] {
+                        ui.selectable_value(&mut self.draft.bandwidth, option, option.as_str());
+                    }
+                });
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Link id");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.draft.link_id)
+                    .desired_width(field)
+                    .hint_text("7669206"),
+            )
+            .on_hover_text(text::SETTINGS_LINK_HINT);
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Radio port");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.draft.radio_port)
+                    .desired_width(field * 0.4)
+                    .hint_text("0"),
+            );
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Key file");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.draft.key_path)
+                    .desired_width(field * 1.6)
+                    .hint_text("gs.key"),
+            )
+            .on_hover_text(text::SETTINGS_KEY_HINT);
+        });
+    }
+
+    /// Where forwarded RTP arrives.
+    fn udp_fields(&mut self, ui: &mut egui::Ui, field: f32) {
+        ui.label(egui::RichText::new(text::SETTINGS_UDP_HINT).weak().small());
+        gap(ui, GAP_BLOCK);
+
+        ui.horizontal(|ui| {
+            ui.label("Listen on");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.draft.bind)
+                    .desired_width(field)
+                    .hint_text("0.0.0.0"),
+            )
+            .on_hover_text(text::SETTINGS_BIND_HINT);
+        });
+        ui.horizontal(|ui| {
+            ui.label("Port");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.draft.port)
+                    .desired_width(field * 0.5)
+                    .hint_text("5600"),
+            );
         });
     }
 }

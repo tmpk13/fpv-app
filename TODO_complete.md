@@ -59,9 +59,81 @@ An egui app showing the drone-cam video stream, for desktop and Android.
       `android_main`, binds `libmediandk.so`
 - [x] README with a mermaid architecture diagram
 
+## Radio route (2026-09-02)
+
+Replacing the forwarded-RTP receive path with a real one: devourer over USB and
+an independent wfb-ng link layer, so the app is the ground station rather than
+a viewer of someone else's.
+
+### Licensing
+
+- [x] Relicensed to GPL-2.0-only, which is what linking devourer requires
+- [x] Own sources dual licensed `MIT OR GPL-2.0-only`, SPDX line on every file
+- [x] `--no-default-features` builds the MIT viewer with no devourer in it
+- [x] devourer and libusb as submodules pinned to exact commits, so the
+      complete corresponding source of a binary is this tree
+- [x] LICENSING.md: what is combined, why wfb-ng's GPL-3.0 cannot be, and how
+      the LGPL relinking obligation is met
+
+### wfb-ng link layer, in Rust
+
+- [x] 802.11 filtering on the "WB" signature and the 32-bit channel id
+- [x] Session packets: `crypto_box` open with gs.key, epoch and channel id
+      checks, FEC parameters, rekey without losing the counters
+- [x] Data packets: the original ChaCha20-Poly1305, 8-byte nonce, block header
+      as additional data
+- [x] Reed-Solomon over GF(2^8) on a systematic Vandermonde matrix, bit
+      compatible with zfec and therefore with wfb-ng
+- [x] Block ring: in-order release without waiting for a block to complete,
+      FEC only when a gap blocks progress, eviction rather than unbounded delay
+- [x] Counters that separate the failure modes: frames heard against frames
+      that were ours, decrypt failures, packets repaired, packets lost
+
+### Driver and platform
+
+- [x] C shim over devourer's C++ `IRtlDevice`, eight functions wide
+- [x] build.rs builds devourer through CMake, the shim through cc, and libusb
+      from source for Android
+- [x] Chip backends selectable; the FPV set by default, all of them behind a
+      feature
+- [x] Desktop: adapter found by USB id, udev rule shipped
+- [x] Android: `UsbManager` through JNI reflection - device list, permission
+      request, `openDevice`, file descriptor - with no Java source and no dex
+- [x] Permission granted by polling `hasPermission` rather than receiving the
+      broadcast, which is what would have needed a Java class
+
+### App
+
+- [x] Source selector: radio or forwarded RTP, both configured and kept
+- [x] Settings page: channel, bandwidth, link id, radio port, key file
+- [x] Link page: signal, SNR, noise floor, per-antenna strength, session and
+      FEC parameters, repairs and losses
+- [x] "No video" card names which stage of the radio link failed
+- [x] Config schema extended, and a config from before the radio still loads
+- [x] Key file resolved per platform: beside the config on desktop, in the
+      app's external files directory on Android
+
+### Verification
+
+- [x] 141 tests, including the link layer against libsodium and wfb-ng's own
+      `fec.c`
+- [x] Every one of the 495 ways to lose four of twelve fragments reconstructs
+- [x] 20000 arbitrary frames through the parsers without a panic
+- [x] Desktop builds with and without the radio feature
+- [x] aarch64 and armv7 Android cdylibs link devourer and libusb statically,
+      export `android_main`, and need no `libc++_shared`
+
 ## Not done
 
+- No adapter was attached. The radio path is verified by construction and by
+  the link layer's tests against the reference implementations, but nothing
+  has confirmed that a real RTL8812AU delivers frames through this shim.
+- Android never run on a device, so the USB permission flow is compile-
+  verified only.
 - On-screen rendering never confirmed visually - no working screenshot path in
-  this environment. See NOTES.md.
-- Android never run on a device.
-- Never tested against the real air unit; only against synthetic streams.
+  this environment.
+- Never tested against the real air unit; only against synthetic streams and
+  generated fixtures.
+- Injection is not exposed. devourer can transmit, and a ground station that
+  could send RC or an adaptive-link downlink would need it; this build only
+  receives.

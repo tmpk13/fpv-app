@@ -19,7 +19,7 @@ use std::net::Ipv4Addr;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use drone_app::video::{self, Codec, Source};
+use drone_app::video::{self, Codec, Source, SourceKind, UdpSettings};
 
 /// How long to wait for the first decoded frame.
 ///
@@ -86,13 +86,29 @@ fn send(encoder: &str, port: u16) -> Sender {
     Sender(child)
 }
 
-/// A port nothing else is using, taken by binding one and letting it go.
+/// A port nothing else is using.
 ///
-/// A fixed port would make two of these tests collide when cargo runs them in
-/// parallel, and would collide with a real wfb_rx on the developer's machine.
+/// Asking the system for an ephemeral one and letting it go is the obvious
+/// way and it is wrong here: the kernel hands the port that was just released
+/// straight back out, so two tests running in parallel get the same number
+/// and one of them fails to bind. Counting up from a base instead gives each
+/// caller in this process a port of its own, and binding it first is what
+/// keeps it clear of whatever else is on the machine.
 fn free_port() -> u16 {
-    let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("binding a port");
-    socket.local_addr().expect("the bound address").port()
+    use std::sync::atomic::{AtomicU16, Ordering};
+
+    // Above the ephemeral range on Linux, so the kernel is not handing these
+    // out to anything else at the same time.
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    let base = 45_000;
+
+    for _ in 0..200 {
+        let port = base + NEXT.fetch_add(1, Ordering::Relaxed);
+        if std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
+            return port;
+        }
+    }
+    panic!("no free port in the test range");
 }
 
 /// Run one codec end to end and return the stats once a frame has decoded.
@@ -106,12 +122,16 @@ fn decode_one(codec: Codec, encoder: &str) -> Option<video::Stats> {
     let handle = video::spawn(
         egui::Context::default(),
         Source {
-            bind: Ipv4Addr::LOCALHOST,
-            port,
+            kind: SourceKind::Udp,
+            udp: UdpSettings {
+                bind: Ipv4Addr::LOCALHOST,
+                port,
+            },
             // Detection is what the app does by default, so it is what the
             // test exercises. `detects_the_codec_from_the_stream` below checks
             // the answer.
             codec: None,
+            ..Source::default()
         },
     );
 
@@ -125,7 +145,7 @@ fn decode_one(codec: Codec, encoder: &str) -> Option<video::Stats> {
         if stats.frames > 0 {
             return Some(stats);
         }
-        if let Some(reason) = stats.bind_error {
+        if let Some(reason) = stats.fault.as_deref() {
             panic!("could not listen on {port}: {reason}");
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -183,14 +203,18 @@ fn a_port_with_nothing_on_it_reports_no_traffic_rather_than_failing() {
     let handle = video::spawn(
         egui::Context::default(),
         Source {
-            bind: Ipv4Addr::LOCALHOST,
-            port: free_port(),
+            kind: SourceKind::Udp,
+            udp: UdpSettings {
+                bind: Ipv4Addr::LOCALHOST,
+                port: free_port(),
+            },
             codec: None,
+            ..Source::default()
         },
     );
     std::thread::sleep(Duration::from_millis(600));
     let stats = handle.stats();
-    assert!(stats.bind_error.is_none(), "the port should have bound");
+    assert!(stats.fault.is_none(), "the port should have bound");
     assert_eq!(stats.rtp.packets, 0);
     assert!(stats.since_packet_s.is_none(), "nothing has ever arrived");
     assert!(!stats.live());
@@ -205,19 +229,23 @@ fn a_port_already_in_use_is_reported_rather_than_crashing() {
     let handle = video::spawn(
         egui::Context::default(),
         Source {
-            bind: Ipv4Addr::LOCALHOST,
-            port,
+            kind: SourceKind::Udp,
+            udp: UdpSettings {
+                bind: Ipv4Addr::LOCALHOST,
+                port,
+            },
             codec: None,
+            ..Source::default()
         },
     );
 
     // The bind is attempted immediately, but give the thread a moment to run.
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
-        if handle.stats().bind_error.is_some() {
+        if handle.stats().fault.is_some() {
             return;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    panic!("a port in use should be reported through bind_error");
+    panic!("a port already in use should be reported through Stats::fault");
 }

@@ -1,6 +1,13 @@
 pub mod app;
 pub mod config;
+/// The radio path: devourer over USB, feeding the wfb-ng link layer.
+///
+/// Absent without the `radio` feature, which is the build that links no
+/// devourer and stays MIT.
+#[cfg(feature = "radio")]
+pub mod radio;
 pub mod video;
+pub mod wfb;
 
 /// Android entry point.
 ///
@@ -24,10 +31,21 @@ fn android_main(android_app: egui_winit::winit::platform::android::activity::And
     let config_path = android_app
         .internal_data_path()
         .map(|dir| dir.join(config::CONFIG_FILE));
-    let config = match config_path {
+    let mut config = match config_path {
         Some(path) => config::AppConfig::load(path),
         None => config::AppConfig::default(),
     };
+
+    // gs.key has to arrive from outside the app, and the internal data
+    // directory is not reachable from a file manager or from adb without
+    // root. The external files directory is: it is
+    // /sdcard/Android/data/<package>/files, visible over USB and to any file
+    // manager, and needs no storage permission because it belongs to this
+    // app. So that is where a key with no absolute path of its own is looked
+    // for, rather than beside the config.
+    if let Some(dir) = android_app.external_data_path() {
+        config.resolve_key_path(dir);
+    }
 
     // Safe-area insets: `content_rect` is the region inside the system bars.
     // Updates on rotation via the InsetsChanged event, so query it each frame

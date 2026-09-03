@@ -1,0 +1,27 @@
+# Reach a Realtek WiFi adapter from an unprivileged process, which is what
+# devourer needs: it drives the chip over libusb rather than through a kernel
+# driver, and libusb needs read/write on the device node.
+#
+#   sudo cp tools/50-drone-app-usb.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#
+# then replug the adapter. Without this the app reports
+# "cannot open the adapter: LIBUSB_ERROR_ACCESS".
+#
+# TAG+="uaccess" grants the user at the physical seat, which is the right
+# grant for a ground station someone is sitting at; MODE="0660" with a group
+# would be the right one for a headless machine.
+#
+# 0bda is Realtek. OEM-rebadged sticks (TP-Link 2357, COMFAST, LB-LINK)
+# enumerate under their own vendor id and need a line of their own.
+SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="8812", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="8813", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="0811", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="a811", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="b811", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="881a", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="881b", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="881c", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="a81a", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="e822", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="a82a", TAG+="uaccess"

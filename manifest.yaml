@@ -4,10 +4,15 @@
 # build-time complaint. cargo-apk is the only way to get an armeabi-v7a APK, so
 # its copy matters.
 #
-# The stream arrives over the local network from the ground station, so the app
-# needs the network permissions and nothing else - no camera, no storage, no
-# location. INTERNET is what allows a socket to be opened at all; without it
-# the bind fails and the Video page reports "permission denied".
+# The app drives a USB WiFi adapter and receives the link itself, so what it
+# needs is the USB host feature and nothing else - no camera, no storage, no
+# location. INTERNET is still here because the forwarded-RTP source is still a
+# source: without it a socket cannot be opened at all and the Video page
+# reports "permission denied".
+#
+# There is no permission to declare for USB. Access is granted per device by
+# the user, at runtime, through the dialog UsbManager.requestPermission puts
+# up - which is exactly why an unrooted phone can run a WiFi driver at all.
 android:
   manifest:
     package: rs.drone.app
@@ -15,3 +20,9 @@ android:
       - name: android.permission.INTERNET
       - name: android.permission.ACCESS_NETWORK_STATE
       - name: android.permission.ACCESS_WIFI_STATE
+    uses_feature:
+      # Required, not optional: without USB host support there is no adapter
+      # to drive, and the app is a viewer for someone else's ground station.
+      # A device that cannot do OTG should not be offered the install.
+      - name: android.hardware.usb.host
+        required: true

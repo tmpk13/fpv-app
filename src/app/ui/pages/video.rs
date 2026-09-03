@@ -126,25 +126,34 @@ impl DroneApp {
     fn draw_no_video(&self, ui: &mut egui::Ui, rect: egui::Rect, stats: &Stats) {
         let unit = em(ui);
         let width = (rect.width() * CARD_WIDTH_FRAC).min(unit * CARD_WIDTH_MAX_EM);
-        let bind = self.config.source.bind.to_string();
-        let port = self.config.source.port;
+        let source = &self.config.source;
+        let radio = source.kind == crate::video::SourceKind::Radio;
 
         // Each of these is a different fault with a different fix. Reporting
-        // them apart is most of this page's value when the link is down, which
-        // is exactly when a bare black screen is least helpful.
-        let body = if let Some(reason) = stats.bind_error {
-            text::bind_failed(reason, &bind, port)
+        // them apart is most of this page's value when the link is down,
+        // which is exactly when a bare black screen is least helpful.
+        let body = if let Some(reason) = stats.fault.as_deref() {
+            // The source itself knows why: a port that would not bind, an
+            // adapter that is not plugged in, a key file that is not there.
+            text::source_failed(reason, radio)
+        } else if radio {
+            text::radio_no_video(
+                radio_stage(stats),
+                source.radio.channel,
+                source.radio.bandwidth.as_str(),
+                source.radio.link_id,
+            )
         } else {
+            let bind = source.udp.bind.to_string();
+            let port = source.udp.port;
             match (stats.since_packet_s, stats.since_frame_s) {
-                // On Android wfb_rx is on another machine by definition -
-                // the phone cannot drive the dongle - so the advice there is
-                // always the `-c` version. The bind address cannot stand in
-                // for this: the desktop app also defaults to 0.0.0.0, and
-                // that already covers loopback.
+                // On Android a forwarded stream comes from another machine by
+                // definition, so the advice there is always the `-c` version.
+                // The bind address cannot stand in for this: the desktop app
+                // also defaults to 0.0.0.0, and that already covers loopback.
                 (None, _) => text::no_packets(&bind, port, cfg!(target_os = "android")),
                 (Some(quiet), _) if quiet > 2.0 => text::packets_stopped(quiet),
-                (Some(_), None) => text::NO_FRAMES.to_string(),
-                (Some(_), Some(_)) => text::NO_FRAMES.to_string(),
+                (Some(_), _) => text::NO_FRAMES.to_string(),
             }
         };
 
@@ -226,6 +235,42 @@ fn health_color(stats: &Stats, settings: &crate::config::UiSettings) -> egui::Co
     } else {
         settings.ok
     }
+}
+
+/// How far the radio link got, from the counters.
+///
+/// The order is the order the link comes up in, so the first thing that has
+/// not happened is the thing to report. Anything later than it would be
+/// misleading: a link with no session key also has no decoded frames, and
+/// saying "nothing is decoding" would send the user to the codec setting for
+/// a problem that is a key file.
+fn radio_stage(stats: &Stats) -> text::RadioStage {
+    // A link that worked and then went quiet: every counter below is
+    // cumulative and would still read healthy.
+    if stats.rtp.packets > 0 {
+        if let Some(quiet) = stats.since_packet_s.filter(|q| *q > 2.0) {
+            return text::RadioStage::Stopped(quiet);
+        }
+    }
+
+    #[cfg(feature = "radio")]
+    if let Some(radio) = stats.radio.as_ref() {
+        let link = &radio.link;
+        if link.total_frames == 0 {
+            return text::RadioStage::Silent;
+        }
+        if link.frames == 0 {
+            return text::RadioStage::NotOurs;
+        }
+        if !link.has_session() {
+            return text::RadioStage::NoSession;
+        }
+        if link.agg.packets_out == 0 && link.decrypt_errors > 0 {
+            return text::RadioStage::NotDecrypting;
+        }
+    }
+
+    text::RadioStage::NotDecoding
 }
 
 #[cfg(test)]
