@@ -50,13 +50,26 @@ fn main() {
             }
             let reused_each = start.elapsed() / runs;
 
+            // What the UI thread then does with the result. It is a second
+            // pass over the same number of pixels, so the frame budget is
+            // both of these and not just the conversion.
+            let start = Instant::now();
+            for _ in 0..runs {
+                let image =
+                    egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &out);
+                std::hint::black_box(&image);
+            }
+            let upload_each = start.elapsed() / runs;
+
+            let total = fresh_each + upload_each;
             println!(
-                "{w}x{h} {layout:?}: fresh {:>5.2} ms ({:>4.0} fps) | \
-                 reused {:>5.2} ms ({:>4.0} fps)",
+                "{w}x{h} {layout:?}: convert {:>5.2} ms (reused {:>5.2}) + \
+                 ColorImage {:>5.2} ms = {:>5.2} ms -> {:>4.0} fps ceiling",
                 fresh_each.as_secs_f64() * 1e3,
-                1.0 / fresh_each.as_secs_f64(),
                 reused_each.as_secs_f64() * 1e3,
-                1.0 / reused_each.as_secs_f64(),
+                upload_each.as_secs_f64() * 1e3,
+                total.as_secs_f64() * 1e3,
+                1.0 / total.as_secs_f64(),
             );
         }
     }
