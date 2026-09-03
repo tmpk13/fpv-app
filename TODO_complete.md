@@ -125,12 +125,19 @@ a viewer of someone else's.
 - [x] Run on a Pixel 8a: installs, starts, renders through Vulkan, loads its
       config, finds the key file, and executes the whole JNI chain into
       `UsbManager` - reporting an empty device list from our own code
+- [x] **On the air.** An RTL8812AU-VS on a desktop against the real air unit:
+      devourer brings the chip up through the shim, the link layer opens the
+      session, and 4 MB of video comes out in eight seconds - 6170 frames
+      ours of 6476 heard, no decrypt errors, sixteen packets rebuilt by the
+      erasure code, RSSI -36 dBm
+- [x] `examples/link-probe.rs`, the Link page as a terminal program, which is
+      what separates a wrong channel from a wrong link id from a wrong key
 
 ## Not done
 
-- No adapter was attached. The radio path is verified by construction and by
-  the link layer's tests against the reference implementations, but nothing
-  has confirmed that a real RTL8812AU delivers frames through this shim.
+- Nothing has decoded a picture from the radio yet: the probe confirms RTP
+  packets arrive intact, but the GUI has not been watched with an air unit
+  transmitting.
 - On Android, everything past an empty USB device list is untested:
   `hasPermission`, `requestPermission`, `openDevice` and
   `libusb_wrap_sys_device`. A phone tethered to a computer is a USB device
